@@ -4,21 +4,31 @@
 Reads deploy.test.yml / deploy.prod.yml from an application repository, validates them
 against the platform rules and renders what the workflow needs.
 
-  glwork_deploy.py plan                         -> GITHUB_OUTPUT: test/prod settings as JSON
+  glwork_deploy.py plan                         -> GITHUB_OUTPUT: test/prod settings as JSON (current = $DEPLOY_ENV)
   glwork_deploy.py render-k8s ENV IMAGE         -> Kubernetes manifests on stdout
   glwork_deploy.py approval-message             -> Telegram sendMessage JSON on stdout
   glwork_deploy.py promote-k8s INFRA_DIR IMAGE  -> write the production bundle into infra
+  glwork_deploy.py image-exists IMAGE:TAG       -> exit 0 if the tag is already in the registry
 
 Only the standard library is used. The descriptor files are a small YAML subset:
 "key: value" lines, '#' comments, no nesting.
 """
+import base64
 import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
-TARGETS = {"aliyun-prod": "aliyun", "aws-prod": "aws"}
 FRPS_IP = "8.217.141.116"
+# Deploy targets: Rancher clusters labelled glwork.net/target=<name>. The platform team adds a
+# cluster here when it joins Rancher. ingress: the IP DNS records point at; proxied: Cloudflare proxy.
+DEFAULT_TARGET = "office"
+TARGETS = {
+    "office": {"ingress": FRPS_IP, "proxied": False, "direct": True},  # office cluster, via the HK frps
+}
 REGISTRY = "glwork-registry.cn-hongkong.cr.aliyuncs.com/glwork"
 NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,38}[a-z0-9])?$")
 TEST_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.(int\.)?glwork\.dev$")
@@ -82,24 +92,24 @@ def settings(env):
     s["context"] = d.get("context", ".")
     s["dockerfile"] = d.get("dockerfile", "")
     s["public"] = d.get("public", "true") == "true"
+    s["target"] = d.get("target", DEFAULT_TARGET)
+    if s["target"] not in TARGETS:
+        fail(f"{path}: target '{s['target']}' is not a registered cluster ({', '.join(TARGETS)}); ask the platform team")
     if env == "test":
         s["team"] = d.get("team", "")
         if not NAME_RE.match(s["team"] or "-"):
             fail(f"{path}: team is required (the namespace assigned by the platform)")
+        if not TARGETS[s["target"]].get("direct"):
+            fail(f"{path}: test deployments currently run on target {DEFAULT_TARGET} only")
         s["namespace"] = s["team"]
-        s["secret"] = "KUBECONFIG_" + s["team"].upper().replace("-", "_")
         s["host"] = d.get("host", f"{s['name']}.glwork.dev")
         if s["public"] and not TEST_HOST_RE.match(s["host"]):
             fail(f"{path}: host '{s['host']}' must be <name>.glwork.dev or <name>.int.glwork.dev")
     else:
-        s["target"] = d.get("target", "")
-        if s["target"] not in TARGETS:
-            fail(f"{path}: target must be one of {', '.join(TARGETS)}")
         s["namespace"] = d.get("namespace", s["name"])
         s["host"] = d.get("host", f"{s['name']}.glwork.net")
         if s["public"] and not PROD_HOST_RE.match(s["host"]):
             fail(f"{path}: host '{s['host']}' must be <name>.glwork.net")
-        s["ingress_target"] = d.get("ingress_target", "")  # cluster entry IP, set by the platform
     return s
 
 
@@ -123,6 +133,10 @@ def cmd_plan():
     out("prod", json.dumps(prod or {}))
     out("has_test", "true" if test else "false")
     out("has_prod", "true" if prod else "false")
+    # DEPLOY_ENV (test | prod, from the pushed branch) selects the descriptor this run deploys.
+    cur = {"test": test, "prod": prod}.get(os.environ.get("DEPLOY_ENV", ""))
+    out("current", json.dumps(cur or {}))
+    out("has_current", "true" if cur else "false")
     print(json.dumps({"type": kind, "name": name, "test": test, "prod": prod}, ensure_ascii=False, indent=2))
 
 
@@ -176,11 +190,9 @@ spec:
   ports: [{{name: http, port: 80, targetPort: http}}]
 """
     if s["public"]:
-        if s["env"] == "test":
-            ann = f'    external-dns.kubernetes.io/target: "{FRPS_IP}"\n    external-dns.kubernetes.io/cloudflare-proxied: "false"\n'
-        else:
-            target = s["ingress_target"] or "REPLACE_WITH_CLUSTER_ENTRY_IP"
-            ann = f'    external-dns.kubernetes.io/target: "{target}"\n    external-dns.kubernetes.io/cloudflare-proxied: "true"\n'
+        t = TARGETS[s["target"]]
+        proxied, entry = ("true" if t["proxied"] else "false"), t["ingress"]
+        ann = f'    external-dns.kubernetes.io/target: "{entry}"\n    external-dns.kubernetes.io/cloudflare-proxied: "{proxied}"\n'
         y += f"""---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -218,7 +230,7 @@ def cmd_approval_message():
     run = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
     title = os.environ.get("COMMIT_TITLE", "").strip()[:80]
     version = os.environ.get("WORKER_VERSION", "")
-    target = s.get("target") or f"worker:{s['wrangler_env']}"
+    target = s["target"] if s["type"] == "k8s" else f"worker:{s['wrangler_env']}"
     esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     lines = [
         f"🟡 <b>待审核</b> · 正式发布 → <b>{esc(target)}</b>",
@@ -258,7 +270,7 @@ defaultNamespace: {s['namespace']}
 targetCustomizations:
   - name: {s['target']}
     clusterSelector:
-      matchLabels: {{env: production, site: {TARGETS[s['target']]}}}
+      matchLabels: {{glwork.net/target: {s['target']}}}
   - name: other-clusters
     clusterSelector: {{}}
     doNotDeploy: true
@@ -266,6 +278,47 @@ targetCustomizations:
     with open(os.path.join(d, "manifests.yaml"), "w") as f:
         f.write(render(s, image))
     print(d)
+
+
+def cmd_image_exists(ref):
+    """HEAD the manifest with the registry token flow; credentials from ACR_USERNAME / ACR_PASSWORD."""
+    m = re.match(r"^([^/]+)/(.+):([^:/]+)$", ref)
+    if not m:
+        fail(f"image-exists: expected REGISTRY/REPO:TAG, got {ref}")
+    host, repo, tag = m.groups()
+    basic = base64.b64encode(f"{os.environ['ACR_USERNAME']}:{os.environ['ACR_PASSWORD']}".encode()).decode()
+    accept = ", ".join([
+        "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ])
+    url = f"https://{host}/v2/{repo}/manifests/{tag}"
+
+    def head(auth):
+        req = urllib.request.Request(url, method="HEAD", headers={"Accept": accept, "Authorization": auth})
+        return urllib.request.urlopen(req, timeout=20).status
+
+    try:
+        head(f"Basic {basic}")
+        sys.exit(0)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            sys.exit(1)
+        if e.code != 401:
+            raise
+        challenge = e.headers.get("WWW-Authenticate", "")
+    params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+    q = urllib.parse.urlencode({"service": params.get("service", ""), "scope": f"repository:{repo}:pull"})
+    req = urllib.request.Request(f"{params['realm']}?{q}", headers={"Authorization": f"Basic {basic}"})
+    token = json.load(urllib.request.urlopen(req, timeout=20))
+    token = token.get("token") or token.get("access_token")
+    try:
+        head(f"Bearer {token}")
+        sys.exit(0)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            sys.exit(1)
+        raise
 
 
 def main():
@@ -278,6 +331,8 @@ def main():
         cmd_approval_message()
     elif a[:1] == ["promote-k8s"] and len(a) == 3:
         cmd_promote_k8s(a[1], a[2])
+    elif a[:1] == ["image-exists"] and len(a) == 2:
+        cmd_image_exists(a[1])
     else:
         fail(__doc__)
 
