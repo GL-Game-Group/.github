@@ -20,6 +20,43 @@
 #         approved_by: {default: ""}
 #         worker_version: {default: ""}
 #   jobs:
+#     deploy:
+#       uses: GL-Game-Group/.github/.github/workflows/deploy.yml@main
+#       with:
+#         action: ${{ inputs.action || 'push' }}
+#         sha: ${{ inputs.sha }}
+#         approved_by: ${{ inputs.approved_by }}
+#         worker_version: ${{ inputs.worker_version }}
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: push (build, test, request approval) or promote (worker production release)
+        type: string
+        default: push
+      sha:
+        type: string
+        default: ""
+      approved_by:
+        type: string
+        default: ""
+      worker_version:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.repository }}-${{ inputs.action }}
+  cancel-in-progress: false
+
+env:
+  SHA: ${{ inputs.sha || github.sha }}
+
+jobs:
   push:
     if: inputs.action == 'push'
     runs-on: gl-internal
