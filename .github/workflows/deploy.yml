@@ -198,6 +198,10 @@ jobs:
         run: |
           export COMMIT_TITLE="$(git log -1 --pretty=%s)"
           [ -n "$TG_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || { echo "::error::org secrets TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not available to this repository"; exit 1; }
+          # Diagnose common misconfigurations without printing the secrets themselves.
+          printf '%s' "$TELEGRAM_CHAT_ID" | python3 -c 'import sys;v=sys.stdin.read();ok=v.lstrip("-").isdigit() and v.isascii();print("TELEGRAM_CHAT_ID: length=%d ascii_digits=%s starts_with_ascii_minus=%s" % (len(v), ok, v.startswith("-")));sys.exit(0 if ok else "::error::TELEGRAM_CHAT_ID must be ASCII digits with an optional leading - (check for spaces, quotes or a full-width minus)")'
+          curl -sS -m 20 "https://api.telegram.org/bot$TG_TOKEN/getMe" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("TELEGRAM_BOT_TOKEN belongs to: @%s" % (d.get("result") or {}).get("username", "?") if d.get("ok") else "::error::TELEGRAM_BOT_TOKEN rejected: %s" % d.get("description"))'
+
           python3 .glwork/scripts/glwork_deploy.py approval-message > "$RUNNER_TEMP/approval.json"
           curl -sS -m 20 -H 'Content-Type: application/json' -d @"$RUNNER_TEMP/approval.json" \
             "https://api.telegram.org/bot$TG_TOKEN/sendMessage" > "$RUNNER_TEMP/tg.json"
