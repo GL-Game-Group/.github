@@ -197,8 +197,11 @@ jobs:
           WORKER_VERSION: ${{ steps.upload.outputs.version }}
         run: |
           export COMMIT_TITLE="$(git log -1 --pretty=%s)"
-          python3 .glwork/scripts/glwork_deploy.py approval-message \
-            | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TG_TOKEN/sendMessage" >/dev/null
+          [ -n "$TG_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || { echo "::error::org secrets TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not available to this repository"; exit 1; }
+          python3 .glwork/scripts/glwork_deploy.py approval-message > "$RUNNER_TEMP/approval.json"
+          curl -sS -m 20 -H 'Content-Type: application/json' -d @"$RUNNER_TEMP/approval.json" \
+            "https://api.telegram.org/bot$TG_TOKEN/sendMessage" > "$RUNNER_TEMP/tg.json"
+          python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0) if d.get("ok") else sys.exit("::error::Telegram: %s" % d.get("description"))' "$RUNNER_TEMP/tg.json"
           echo "正式发布已提交审核：请群管理员在 Telegram 群点击「✅ 确认」。" >> "$GITHUB_STEP_SUMMARY"
 
   promote:
