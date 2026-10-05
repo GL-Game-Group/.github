@@ -242,7 +242,7 @@ jobs:
         run: |
           python3 .glwork/scripts/glwork_deploy.py promote-k8s .infra "$IMAGE"
           cd .infra
-          git config user.name "gl-release-bot"; git config user.email "gl-release-bot@users.noreply.github.com"
+          git config user.name "gl-work-release-bot"; git config user.email "gl-work-release-bot@users.noreply.github.com"
           git add fleet/apps-prod
           git diff --cached --quiet && { echo "already released"; exit 0; }
           git commit -m "release ${{ needs.plan.outputs.name }} $(echo "$SHA" | cut -c1-12) to ${{ fromJSON(needs.plan.outputs.prod).target }}" \
