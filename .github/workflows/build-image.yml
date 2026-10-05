@@ -1,12 +1,16 @@
-# Reusable workflow: build a container image on the office build machines (gl-internal) and
-# push it to the company registry (Aliyun ACR). No GitHub secrets: registry credentials come
-# from the runner environment (External Secrets Operator <- mgmt glwork-secrets/ci-registry).
+# Reusable workflow: build a container image and push it to the company registry (Aliyun ACR).
 #
 #   jobs:
 #     image:
 #       uses: GL-Game-Group/.github/.github/workflows/build-image.yml@main
 #       with:
 #         image: my-app            # repository name in ACR (default: the GitHub repo name)
+#       secrets: inherit           # only used by public repositories
+#
+# Private repositories build on the office build machines (gl-internal); registry credentials
+# come from the runner environment (External Secrets Operator <- mgmt glwork-secrets/ci-registry).
+# Public repositories never run on office machines: they build on GitHub-hosted runners with the
+# organization secrets ACR_USERNAME / ACR_PASSWORD.
 #
 # Tags: the full commit SHA and the branch name.
 name: build-image
@@ -24,6 +28,11 @@ on:
         description: Dockerfile path (default <context>/Dockerfile)
         type: string
         default: ""
+    secrets:
+      ACR_USERNAME:
+        required: false
+      ACR_PASSWORD:
+        required: false
     outputs:
       image:
         description: Pushed image reference with the commit SHA tag
@@ -34,12 +43,13 @@ permissions:
 
 jobs:
   build:
-    runs-on: gl-internal
+    runs-on: ${{ github.event.repository.private && 'gl-internal' || 'ubuntu-latest' }}
     outputs:
-      image: ${{ steps.build.outputs.image }}
+      image: ${{ steps.build.outputs.image || steps.public.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - id: build
+        if: github.event.repository.private
         env:
           NAME: ${{ inputs.image }}
           CONTEXT: ${{ inputs.context }}
@@ -59,3 +69,41 @@ jobs:
             --import-cache "type=registry,ref=$repo:buildcache"
           echo "image=$repo:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo "Pushed \`$repo:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # Public repositories: GitHub-hosted runner.
+      - id: ref
+        if: ${{ !github.event.repository.private }}
+        env:
+          NAME: ${{ inputs.image }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+        run: |
+          [ -n "$ACR_USERNAME" ] || { echo "::error::ACR_USERNAME / ACR_PASSWORD missing: add 'secrets: inherit' to the calling job"; exit 1; }
+          [ -n "$NAME" ] || NAME="${GITHUB_REPOSITORY#*/}"
+          repo="glwork-registry.cn-hongkong.cr.aliyuncs.com/glwork/${NAME,,}"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "branch=$(echo "$GITHUB_REF_NAME" | tr '/' '-' | tr -cd '[:alnum:]._-')" >> "$GITHUB_OUTPUT"
+      - if: ${{ !github.event.repository.private }}
+        uses: docker/setup-buildx-action@v3
+      - if: ${{ !github.event.repository.private }}
+        uses: docker/login-action@v3
+        with:
+          registry: glwork-registry.cn-hongkong.cr.aliyuncs.com
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - if: ${{ !github.event.repository.private }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.ref.outputs.repo }}:${{ github.sha }}
+            ${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.branch }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - id: public
+        if: ${{ !github.event.repository.private }}
+        run: |
+          echo "image=${{ steps.ref.outputs.repo }}:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`${{ steps.ref.outputs.repo }}:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
