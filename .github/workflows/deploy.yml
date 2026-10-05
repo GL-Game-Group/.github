@@ -4,6 +4,7 @@
 # mgmt cluster (namespace glwork-secrets, edited in Rancher).
 #
 #   push to main -> build (BuildKit) -> deploy test (automatic) -> ask for production approval in Telegram
+#                   (one job: every job costs ~13 s of runner start-up and teardown)
 #   approval     -> release-bot: k8s = commits the release to infra (Fleet deploys it)
 #                                worker = dispatches this workflow with action=promote
 #
@@ -19,72 +20,23 @@
 #         approved_by: {default: ""}
 #         worker_version: {default: ""}
 #   jobs:
-#     deploy:
-#       uses: GL-Game-Group/.github/.github/workflows/deploy.yml@main
-#       with:
-#         action: ${{ inputs.action || 'push' }}
-#         sha: ${{ inputs.sha }}
-#         approved_by: ${{ inputs.approved_by }}
-#         worker_version: ${{ inputs.worker_version }}
-name: deploy
-
-on:
-  workflow_call:
-    inputs:
-      action:
-        description: push (build, test, request approval) or promote (worker production release)
-        type: string
-        default: push
-      sha:
-        type: string
-        default: ""
-      approved_by:
-        type: string
-        default: ""
-      worker_version:
-        type: string
-        default: ""
-
-permissions:
-  contents: read
-
-concurrency:
-  group: deploy-${{ github.repository }}-${{ inputs.action }}
-  cancel-in-progress: false
-
-env:
-  SHA: ${{ inputs.sha || github.sha }}
-
-jobs:
-  plan:
+  push:
+    if: inputs.action == 'push'
     runs-on: gl-internal
-    outputs:
-      type: ${{ steps.plan.outputs.type }}
-      name: ${{ steps.plan.outputs.name }}
-      image: ${{ steps.plan.outputs.image }}
-      test: ${{ steps.plan.outputs.test }}
-      prod: ${{ steps.plan.outputs.prod }}
-      has_test: ${{ steps.plan.outputs.has_test }}
-      has_prod: ${{ steps.plan.outputs.has_prod }}
     steps:
       - uses: actions/checkout@v4
-        with: {ref: "${{ env.SHA }}"}
       - uses: actions/checkout@v4
         with: {repository: GL-Game-Group/.github, path: .glwork}
       - id: plan
         run: python3 .glwork/scripts/glwork_deploy.py plan
 
-  build:
-    needs: plan
-    if: needs.plan.outputs.type == 'k8s' && inputs.action == 'push'
-    runs-on: gl-internal
-    steps:
-      - uses: actions/checkout@v4
+      # k8s: build, then deploy to office-test.
       - name: Build and push with BuildKit
+        if: steps.plan.outputs.type == 'k8s'
         env:
-          IMAGE: ${{ needs.plan.outputs.image }}
-          CONTEXT: ${{ fromJSON(needs.plan.outputs.test || '{}').context || fromJSON(needs.plan.outputs.prod || '{}').context || '.' }}
-          DOCKERFILE: ${{ fromJSON(needs.plan.outputs.test || '{}').dockerfile || fromJSON(needs.plan.outputs.prod || '{}').dockerfile || '' }}
+          IMAGE: ${{ steps.plan.outputs.image }}
+          CONTEXT: ${{ fromJSON(steps.plan.outputs.test || '{}').context || fromJSON(steps.plan.outputs.prod || '{}').context || '.' }}
+          DOCKERFILE: ${{ fromJSON(steps.plan.outputs.test || '{}').dockerfile || fromJSON(steps.plan.outputs.prod || '{}').dockerfile || '' }}
         run: |
           mkdir -p ~/.docker
           python3 -c 'import base64,json,os;print(json.dumps({"auths":{os.environ["ACR_REGISTRY"]:{"auth":base64.b64encode((os.environ["ACR_USERNAME"]+":"+os.environ["ACR_PASSWORD"]).encode()).decode()}}}))' > ~/.docker/config.json
@@ -92,56 +44,46 @@ jobs:
           buildctl build --frontend dockerfile.v0 \
             --local context="$CONTEXT" --local dockerfile="$(dirname "$file")" --opt filename="$(basename "$file")" \
             --opt platform=linux/amd64 \
-            --output "type=image,name=$IMAGE:$GITHUB_SHA,push=true" \
-            --export-cache "type=registry,ref=$IMAGE:buildcache,mode=max" \
-            --import-cache "type=registry,ref=$IMAGE:buildcache"
+            --output "type=image,name=$IMAGE:$GITHUB_SHA,push=true"
           echo "镜像：\`$IMAGE:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
-
-  test-k8s:
-    needs: [plan, build]
-    if: needs.plan.outputs.has_test == 'true' && needs.plan.outputs.type == 'k8s' && inputs.action == 'push'
-    runs-on: gl-internal
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with: {repository: GL-Game-Group/.github, path: .glwork}
       - name: Deploy to office-test
+        if: steps.plan.outputs.type == 'k8s' && steps.plan.outputs.has_test == 'true'
         env:
           DEPLOYED_BY: ${{ github.actor }}
           DEPLOY_VIA: ci
-          IMAGE: ${{ needs.plan.outputs.image }}:${{ github.sha }}
-          NAME: ${{ needs.plan.outputs.name }}
-          NS: ${{ fromJSON(needs.plan.outputs.test).namespace }}
+          IMAGE: ${{ steps.plan.outputs.image }}:${{ github.sha }}
+          NAME: ${{ steps.plan.outputs.name }}
+          NS: ${{ fromJSON(steps.plan.outputs.test || '{}').namespace }}
+          HOST: ${{ fromJSON(steps.plan.outputs.test || '{}').host }}
         run: |
           allowed=$(kubectl -n ci get configmap repo-teams -o json | python3 -c 'import json,os,sys;print(json.load(sys.stdin)["data"].get(os.environ["GITHUB_REPOSITORY"].replace("/","."),""))')
           [ "$allowed" = "$NS" ] || { echo "::error::$GITHUB_REPOSITORY may not deploy into '$NS' (registered team: '${allowed:-none}'). Ask the platform team to add it to infra fleet/platform/ci/repo-teams.yaml"; exit 1; }
           python3 .glwork/scripts/glwork_deploy.py render-k8s test "$IMAGE" > "$RUNNER_TEMP/manifests.yaml"
           kubectl apply -f "$RUNNER_TEMP/manifests.yaml"
           kubectl -n "$NS" rollout status "deploy/$NAME" --timeout=600s
-          echo "测试环境：https://${{ fromJSON(needs.plan.outputs.test).host }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "测试环境：https://$HOST" >> "$GITHUB_STEP_SUMMARY"
 
-  test-worker:
-    needs: plan
-    if: needs.plan.outputs.has_test == 'true' && needs.plan.outputs.type == 'worker' && inputs.action == 'push'
-    runs-on: gl-internal
-    defaults:
-      run:
-        working-directory: ${{ fromJSON(needs.plan.outputs.test).workdir }}
-    steps:
-      - uses: actions/checkout@v4
+      # worker: deploy the test environment with wrangler.
       - uses: actions/setup-node@v4
+        if: steps.plan.outputs.type == 'worker'
         with: {node-version: 22}
-      - run: if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
       - name: Deploy worker (test)
+        if: steps.plan.outputs.type == 'worker' && steps.plan.outputs.has_test == 'true'
+        working-directory: ${{ fromJSON(steps.plan.outputs.test || '{}').workdir || '.' }}
+        env:
+          WRANGLER_ENV: ${{ fromJSON(steps.plan.outputs.test || '{}').wrangler_env }}
         run: |
           export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
           [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::CLOUDFLARE_WORKERS_TOKEN is empty (Rancher: mgmt cluster, glwork-secrets/cloudflare-workers)"; exit 1; }
-          npx --yes wrangler@4 deploy --env "${{ fromJSON(needs.plan.outputs.test).wrangler_env }}"
-      - name: Notify Telegram
+          if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
+          npx --yes wrangler@4 deploy --env "$WRANGLER_ENV"
+      - name: Notify Telegram (worker test)
+        if: steps.plan.outputs.type == 'worker' && steps.plan.outputs.has_test == 'true'
         env:
-          URL: ${{ fromJSON(needs.plan.outputs.test).url }}
+          URL: ${{ fromJSON(steps.plan.outputs.test || '{}').url }}
+          WRANGLER_ENV: ${{ fromJSON(steps.plan.outputs.test || '{}').wrangler_env }}
         run: |
-          text="✅ 发布成功 · <b>worker:${{ fromJSON(needs.plan.outputs.test).wrangler_env }}</b>
+          text="✅ 发布成功 · <b>worker:${WRANGLER_ENV}</b>
           应用：<code>${{ github.repository }}</code>
           提交：<code>$(echo "$SHA" | cut -c1-12)</code>
           部署人：${{ github.actor }}
@@ -150,33 +92,23 @@ jobs:
           python3 -c 'import json,os,sys;print(json.dumps({"chat_id":os.environ["TELEGRAM_CHAT_ID"],"text":sys.argv[1],"parse_mode":"HTML","disable_web_page_preview":True}))' "$text" \
             | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null
 
-  request-prod:
-    needs: [plan, test-k8s, test-worker]
-    if: >-
-      always() && inputs.action == 'push' && github.ref == 'refs/heads/main' &&
-      needs.plan.outputs.has_prod == 'true' &&
-      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
-    runs-on: gl-internal
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with: {repository: GL-Game-Group/.github, path: .glwork}
-      - uses: actions/setup-node@v4
-        if: needs.plan.outputs.type == 'worker'
-        with: {node-version: 22}
+      # Production: ask for approval in Telegram (main only).
       - name: Upload worker version (no traffic yet)
         id: upload
-        if: needs.plan.outputs.type == 'worker'
-        working-directory: ${{ fromJSON(needs.plan.outputs.prod).workdir }}
+        if: steps.plan.outputs.type == 'worker' && steps.plan.outputs.has_prod == 'true' && github.ref == 'refs/heads/main'
+        working-directory: ${{ fromJSON(steps.plan.outputs.prod || '{}').workdir || '.' }}
+        env:
+          WRANGLER_ENV: ${{ fromJSON(steps.plan.outputs.prod || '{}').wrangler_env }}
         run: |
           export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
-          npx --yes wrangler@4 versions upload --env "${{ fromJSON(needs.plan.outputs.prod).wrangler_env }}" \
+          npx --yes wrangler@4 versions upload --env "$WRANGLER_ENV" \
             --tag "$(echo "$SHA" | cut -c1-12)" --message "$(git log -1 --pretty=%s | cut -c1-90)" | tee "$RUNNER_TEMP/upload.log"
           v=$(grep -oE 'Worker Version ID: [0-9a-f-]+' "$RUNNER_TEMP/upload.log" | awk '{print $4}')
           [ -n "$v" ] || { echo "::error::could not read the uploaded Worker Version ID"; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: Ask for approval in Telegram
+        if: steps.plan.outputs.has_prod == 'true' && github.ref == 'refs/heads/main'
         env:
           WORKER_VERSION: ${{ steps.upload.outputs.version }}
         run: |
@@ -190,24 +122,30 @@ jobs:
 
   # Workers only: k8s production releases are committed to infra by release-bot itself.
   promote:
-    needs: plan
-    if: inputs.action == 'promote' && needs.plan.outputs.type == 'worker' && needs.plan.outputs.has_prod == 'true'
+    if: inputs.action == 'promote'
     runs-on: gl-internal
     env:
       APPROVED_BY: ${{ inputs.approved_by }}
     steps:
       - uses: actions/checkout@v4
         with: {ref: "${{ env.SHA }}"}
+      - uses: actions/checkout@v4
+        with: {repository: GL-Game-Group/.github, path: .glwork}
+      - id: plan
+        run: python3 .glwork/scripts/glwork_deploy.py plan
       - uses: actions/setup-node@v4
         with: {node-version: 22}
       - name: Release to production (worker)
-        working-directory: ${{ fromJSON(needs.plan.outputs.prod).workdir }}
+        working-directory: ${{ fromJSON(steps.plan.outputs.prod || '{}').workdir || '.' }}
+        env:
+          WRANGLER_ENV: ${{ fromJSON(steps.plan.outputs.prod || '{}').wrangler_env }}
         run: |
+          [ "${{ steps.plan.outputs.type }}" = worker ] && [ "${{ steps.plan.outputs.has_prod }}" = true ] || { echo "::error::promote is only for type: worker with a deploy.prod.yml (k8s releases are committed to infra by release-bot)"; exit 1; }
           export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
           [ -n "${{ inputs.worker_version }}" ] || { echo "::error::worker_version is required"; exit 1; }
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
           npx --yes wrangler@4 versions deploy "${{ inputs.worker_version }}@100%" \
-            --env "${{ fromJSON(needs.plan.outputs.prod).wrangler_env }}" --message "approved by ${APPROVED_BY}" --yes
+            --env "$WRANGLER_ENV" --message "approved by ${APPROVED_BY}" --yes
       - name: Notify Telegram
         if: always()
         env:

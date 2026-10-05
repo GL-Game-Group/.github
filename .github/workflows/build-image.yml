@@ -64,9 +64,7 @@ jobs:
           buildctl build --frontend dockerfile.v0 \
             --local context="$CONTEXT" --local dockerfile="$(dirname "$file")" --opt filename="$(basename "$file")" \
             --opt platform=linux/amd64 \
-            --output "type=image,\"name=$repo:$GITHUB_SHA,$repo:$branch\",push=true" \
-            --export-cache "type=registry,ref=$repo:buildcache,mode=max" \
-            --import-cache "type=registry,ref=$repo:buildcache"
+            --output "type=image,\"name=$repo:$GITHUB_SHA,$repo:$branch\",push=true"
           echo "image=$repo:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo "Pushed \`$repo:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
 
