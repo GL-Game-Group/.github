@@ -1,20 +1,20 @@
-# Reusable workflow: build a container image and push it to the company registry (Aliyun ACR).
+# Reusable workflow: build a container image on the office build machines (gl-internal) and
+# push it to the company registry (Aliyun ACR). No GitHub secrets: registry credentials come
+# from the runner environment (External Secrets Operator <- mgmt glwork-secrets/ci-registry).
 #
 #   jobs:
 #     image:
 #       uses: GL-Game-Group/.github/.github/workflows/build-image.yml@main
 #       with:
 #         image: my-app            # repository name in ACR (default: the GitHub repo name)
-#       secrets: inherit           # needs ACR_USERNAME / ACR_PASSWORD (org or repo secrets)
 #
-# Tags: the full commit SHA (deploy this one) and the branch name.
+# Tags: the full commit SHA and the branch name.
 name: build-image
 
 on:
   workflow_call:
     inputs:
       image:
-        description: Image repository name in ACR (default the GitHub repository name)
         type: string
         default: ""
       context:
@@ -24,20 +24,6 @@ on:
         description: Dockerfile path (default <context>/Dockerfile)
         type: string
         default: ""
-      platforms:
-        type: string
-        default: linux/amd64
-      registry:
-        type: string
-        default: glwork-registry.cn-hongkong.cr.aliyuncs.com
-      namespace:
-        type: string
-        default: glwork
-    secrets:
-      ACR_USERNAME:
-        required: true
-      ACR_PASSWORD:
-        required: true
     outputs:
       image:
         description: Pushed image reference with the commit SHA tag
@@ -48,39 +34,28 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: gl-internal
     outputs:
-      image: ${{ steps.ref.outputs.image }}
+      image: ${{ steps.build.outputs.image }}
     steps:
       - uses: actions/checkout@v4
-      - id: ref
+      - id: build
+        env:
+          NAME: ${{ inputs.image }}
+          CONTEXT: ${{ inputs.context }}
+          FILE: ${{ inputs.file }}
         run: |
-          name="${{ inputs.image }}"
-          [ -n "$name" ] || name="${GITHUB_REPOSITORY#*/}"
-          repo="${{ inputs.registry }}/${{ inputs.namespace }}/${name,,}"
-          branch="$(echo "${GITHUB_REF_NAME}" | tr '/' '-' | tr -cd '[:alnum:]._-')"
-          echo "repo=$repo" >> "$GITHUB_OUTPUT"
-          echo "image=$repo:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ inputs.registry }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: ${{ inputs.context }}
-          file: ${{ inputs.file }}
-          platforms: ${{ inputs.platforms }}
-          push: true
-          tags: |
-            ${{ steps.ref.outputs.repo }}:${{ github.sha }}
-            ${{ steps.ref.outputs.repo }}:${{ steps.ref.outputs.branch }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Summary
-        run: echo "Pushed \`${{ steps.ref.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$NAME" ] || NAME="${GITHUB_REPOSITORY#*/}"
+          repo="$ACR_REGISTRY/glwork/${NAME,,}"
+          branch="$(echo "$GITHUB_REF_NAME" | tr '/' '-' | tr -cd '[:alnum:]._-')"
+          mkdir -p ~/.docker
+          python3 -c 'import base64,json,os;print(json.dumps({"auths":{os.environ["ACR_REGISTRY"]:{"auth":base64.b64encode((os.environ["ACR_USERNAME"]+":"+os.environ["ACR_PASSWORD"]).encode()).decode()}}}))' > ~/.docker/config.json
+          file="${FILE:-$CONTEXT/Dockerfile}"
+          buildctl build --frontend dockerfile.v0 \
+            --local context="$CONTEXT" --local dockerfile="$(dirname "$file")" --opt filename="$(basename "$file")" \
+            --opt platform=linux/amd64 \
+            --output "type=image,\"name=$repo:$GITHUB_SHA,$repo:$branch\",push=true" \
+            --export-cache "type=registry,ref=$repo:buildcache,mode=max" \
+            --import-cache "type=registry,ref=$repo:buildcache"
+          echo "image=$repo:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "Pushed \`$repo:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"

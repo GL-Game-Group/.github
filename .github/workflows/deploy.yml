@@ -1,7 +1,11 @@
 # Reusable deploy workflow driven by deploy.test.yml / deploy.prod.yml in the app repository.
+# Runs on the office build machines (runs-on: gl-internal); no GitHub secrets are used:
+# credentials come from the runner environment, synced by External Secrets Operator from the
+# mgmt cluster (namespace glwork-secrets, edited in Rancher).
 #
-#   push to main   -> build -> deploy test (automatic) -> ask for production approval in Telegram
-#   approval       -> release-bot dispatches the caller with action=promote -> production release
+#   push to main -> build (BuildKit) -> deploy test (automatic) -> ask for production approval in Telegram
+#   approval     -> release-bot: k8s = commits the release to infra (Fleet deploys it)
+#                                worker = dispatches this workflow with action=promote
 #
 # Caller (.github/workflows/deploy.yml in the app repository):
 #
@@ -22,22 +26,16 @@
 #         sha: ${{ inputs.sha }}
 #         approved_by: ${{ inputs.approved_by }}
 #         worker_version: ${{ inputs.worker_version }}
-#       secrets: inherit
-#
-# Org secrets used: ACR_USERNAME, ACR_PASSWORD, KUBECONFIG_<TEAM>, TELEGRAM_BOT_TOKEN,
-# TELEGRAM_CHAT_ID, CLOUDFLARE_WORKERS_TOKEN, RELEASE_APP_ID, RELEASE_APP_PRIVATE_KEY.
-# Org variable: CLOUDFLARE_ACCOUNT_ID.
 name: deploy
 
 on:
   workflow_call:
     inputs:
       action:
-        description: push (build, test, request approval) or promote (production release)
+        description: push (build, test, request approval) or promote (worker production release)
         type: string
         default: push
       sha:
-        description: Commit to promote (action=promote)
         type: string
         default: ""
       approved_by:
@@ -55,12 +53,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  REGISTRY: glwork-registry.cn-hongkong.cr.aliyuncs.com
   SHA: ${{ inputs.sha || github.sha }}
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: gl-internal
     outputs:
       type: ${{ steps.plan.outputs.type }}
       name: ${{ steps.plan.outputs.name }}
@@ -80,87 +77,78 @@ jobs:
   build:
     needs: plan
     if: needs.plan.outputs.type == 'k8s' && inputs.action == 'push'
-    runs-on: ubuntu-latest
+    runs-on: gl-internal
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: ${{ fromJSON(needs.plan.outputs.test || '{}').context || fromJSON(needs.plan.outputs.prod || '{}').context || '.' }}
-          file: ${{ fromJSON(needs.plan.outputs.test || '{}').dockerfile || fromJSON(needs.plan.outputs.prod || '{}').dockerfile || '' }}
-          platforms: linux/amd64
-          push: true
-          tags: ${{ needs.plan.outputs.image }}:${{ github.sha }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Build and push with BuildKit
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          CONTEXT: ${{ fromJSON(needs.plan.outputs.test || '{}').context || fromJSON(needs.plan.outputs.prod || '{}').context || '.' }}
+          DOCKERFILE: ${{ fromJSON(needs.plan.outputs.test || '{}').dockerfile || fromJSON(needs.plan.outputs.prod || '{}').dockerfile || '' }}
+        run: |
+          mkdir -p ~/.docker
+          python3 -c 'import base64,json,os;print(json.dumps({"auths":{os.environ["ACR_REGISTRY"]:{"auth":base64.b64encode((os.environ["ACR_USERNAME"]+":"+os.environ["ACR_PASSWORD"]).encode()).decode()}}}))' > ~/.docker/config.json
+          file="${DOCKERFILE:-$CONTEXT/Dockerfile}"
+          buildctl build --frontend dockerfile.v0 \
+            --local context="$CONTEXT" --local dockerfile="$(dirname "$file")" --opt filename="$(basename "$file")" \
+            --opt platform=linux/amd64 \
+            --output "type=image,name=$IMAGE:$GITHUB_SHA,push=true" \
+            --export-cache "type=registry,ref=$IMAGE:buildcache,mode=max" \
+            --import-cache "type=registry,ref=$IMAGE:buildcache"
+          echo "镜像：\`$IMAGE:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
 
   test-k8s:
     needs: [plan, build]
     if: needs.plan.outputs.has_test == 'true' && needs.plan.outputs.type == 'k8s' && inputs.action == 'push'
-    runs-on: ubuntu-latest
+    runs-on: gl-internal
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with: {repository: GL-Game-Group/.github, path: .glwork}
       - name: Deploy to office-test
         env:
-          KUBECONFIG_DATA: ${{ secrets[fromJSON(needs.plan.outputs.test).secret] }}
           DEPLOYED_BY: ${{ github.actor }}
           DEPLOY_VIA: ci
           IMAGE: ${{ needs.plan.outputs.image }}:${{ github.sha }}
           NAME: ${{ needs.plan.outputs.name }}
           NS: ${{ fromJSON(needs.plan.outputs.test).namespace }}
-          SECRET_NAME: ${{ fromJSON(needs.plan.outputs.test).secret }}
         run: |
-          [ -n "$KUBECONFIG_DATA" ] || { echo "::error::org secret $SECRET_NAME is missing (ask the platform team)"; exit 1; }
-          printf '%s' "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"; chmod 600 "$RUNNER_TEMP/kubeconfig"
-          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          allowed=$(kubectl -n ci get configmap repo-teams -o json | python3 -c 'import json,os,sys;print(json.load(sys.stdin)["data"].get(os.environ["GITHUB_REPOSITORY"].replace("/","."),""))')
+          [ "$allowed" = "$NS" ] || { echo "::error::$GITHUB_REPOSITORY may not deploy into '$NS' (registered team: '${allowed:-none}'). Ask the platform team to add it to infra fleet/platform/ci/repo-teams.yaml"; exit 1; }
           python3 .glwork/scripts/glwork_deploy.py render-k8s test "$IMAGE" > "$RUNNER_TEMP/manifests.yaml"
           kubectl apply -f "$RUNNER_TEMP/manifests.yaml"
           kubectl -n "$NS" rollout status "deploy/$NAME" --timeout=600s
-      - name: Summary
-        run: echo "测试环境：https://${{ fromJSON(needs.plan.outputs.test).host }}（镜像 \`${{ github.sha }}\`）" >> "$GITHUB_STEP_SUMMARY"
+          echo "测试环境：https://${{ fromJSON(needs.plan.outputs.test).host }}" >> "$GITHUB_STEP_SUMMARY"
 
   test-worker:
     needs: plan
     if: needs.plan.outputs.has_test == 'true' && needs.plan.outputs.type == 'worker' && inputs.action == 'push'
-    runs-on: ubuntu-latest
+    runs-on: gl-internal
     defaults:
       run:
         working-directory: ${{ fromJSON(needs.plan.outputs.test).workdir }}
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKERS_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: {node-version: 22}
       - run: if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
       - name: Deploy worker (test)
-        run: npx --yes wrangler@4 deploy --env "${{ fromJSON(needs.plan.outputs.test).wrangler_env }}"
+        run: |
+          export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::CLOUDFLARE_WORKERS_TOKEN is empty (Rancher: mgmt cluster, glwork-secrets/cloudflare-workers)"; exit 1; }
+          npx --yes wrangler@4 deploy --env "${{ fromJSON(needs.plan.outputs.test).wrangler_env }}"
       - name: Notify Telegram
         env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           URL: ${{ fromJSON(needs.plan.outputs.test).url }}
         run: |
-          [ -n "$TG_TOKEN" ] || exit 0
           text="✅ 发布成功 · <b>worker:${{ fromJSON(needs.plan.outputs.test).wrangler_env }}</b>
           应用：<code>${{ github.repository }}</code>
           提交：<code>$(echo "$SHA" | cut -c1-12)</code>
           部署人：${{ github.actor }}
           方式：ci${URL:+
           地址：$URL}"
-          python3 -c 'import json,os,sys;print(json.dumps({"chat_id":os.environ["TG_CHAT"],"text":sys.argv[1],"parse_mode":"HTML","disable_web_page_preview":True}))' "$text" \
-            | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TG_TOKEN/sendMessage" >/dev/null
+          python3 -c 'import json,os,sys;print(json.dumps({"chat_id":os.environ["TELEGRAM_CHAT_ID"],"text":sys.argv[1],"parse_mode":"HTML","disable_web_page_preview":True}))' "$text" \
+            | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null
 
   request-prod:
     needs: [plan, test-k8s, test-worker]
@@ -168,10 +156,7 @@ jobs:
       always() && inputs.action == 'push' && github.ref == 'refs/heads/main' &&
       needs.plan.outputs.has_prod == 'true' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKERS_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    runs-on: gl-internal
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -184,6 +169,7 @@ jobs:
         if: needs.plan.outputs.type == 'worker'
         working-directory: ${{ fromJSON(needs.plan.outputs.prod).workdir }}
         run: |
+          export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
           npx --yes wrangler@4 versions upload --env "${{ fromJSON(needs.plan.outputs.prod).wrangler_env }}" \
             --tag "$(echo "$SHA" | cut -c1-12)" --message "$(git log -1 --pretty=%s | cut -c1-90)" | tee "$RUNNER_TEMP/upload.log"
@@ -192,70 +178,32 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: Ask for approval in Telegram
         env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WORKER_VERSION: ${{ steps.upload.outputs.version }}
         run: |
+          printf '%s' "$TELEGRAM_CHAT_ID" | python3 -c 'import sys;v=sys.stdin.read();sys.exit(0 if v.lstrip("-").isdigit() and v.isascii() else "::error::TELEGRAM_CHAT_ID must be ASCII digits with an optional leading - (Rancher: glwork-secrets/telegram)")'
           export COMMIT_TITLE="$(git log -1 --pretty=%s)"
-          [ -n "$TG_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || { echo "::error::org secrets TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not available to this repository"; exit 1; }
-          # Diagnose common misconfigurations without printing the secrets themselves.
-          printf '%s' "$TELEGRAM_CHAT_ID" | python3 -c 'import sys;v=sys.stdin.read();ok=v.lstrip("-").isdigit() and v.isascii();print("TELEGRAM_CHAT_ID: length=%d ascii_digits=%s starts_with_ascii_minus=%s" % (len(v), ok, v.startswith("-")));sys.exit(0 if ok else "::error::TELEGRAM_CHAT_ID must be ASCII digits with an optional leading - (check for spaces, quotes or a full-width minus)")'
-          curl -sS -m 20 "https://api.telegram.org/bot$TG_TOKEN/getMe" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("TELEGRAM_BOT_TOKEN belongs to: @%s" % (d.get("result") or {}).get("username", "?") if d.get("ok") else "::error::TELEGRAM_BOT_TOKEN rejected: %s" % d.get("description"))'
-
           python3 .glwork/scripts/glwork_deploy.py approval-message > "$RUNNER_TEMP/approval.json"
           curl -sS -m 20 -H 'Content-Type: application/json' -d @"$RUNNER_TEMP/approval.json" \
-            "https://api.telegram.org/bot$TG_TOKEN/sendMessage" > "$RUNNER_TEMP/tg.json"
+            "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" > "$RUNNER_TEMP/tg.json"
           python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0) if d.get("ok") else sys.exit("::error::Telegram: %s" % d.get("description"))' "$RUNNER_TEMP/tg.json"
           echo "正式发布已提交审核：请群管理员在 Telegram 群点击「✅ 确认」。" >> "$GITHUB_STEP_SUMMARY"
 
+  # Workers only: k8s production releases are committed to infra by release-bot itself.
   promote:
     needs: plan
-    if: inputs.action == 'promote' && needs.plan.outputs.has_prod == 'true'
-    runs-on: ubuntu-latest
+    if: inputs.action == 'promote' && needs.plan.outputs.type == 'worker' && needs.plan.outputs.has_prod == 'true'
+    runs-on: gl-internal
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKERS_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
       APPROVED_BY: ${{ inputs.approved_by }}
     steps:
       - uses: actions/checkout@v4
         with: {ref: "${{ env.SHA }}"}
-      - uses: actions/checkout@v4
-        with: {repository: GL-Game-Group/.github, path: .glwork}
-      # --- Kubernetes: commit the release into infra; Fleet rolls it out ---
-      - uses: actions/create-github-app-token@v1
-        id: app
-        if: needs.plan.outputs.type == 'k8s'
-        with:
-          app-id: ${{ secrets.RELEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: GL-Game-Group
-          repositories: infra
-      - uses: actions/checkout@v4
-        if: needs.plan.outputs.type == 'k8s'
-        with: {repository: GL-Game-Group/infra, path: .infra, token: "${{ steps.app.outputs.token }}"}
-      - name: Release to production (k8s)
-        if: needs.plan.outputs.type == 'k8s'
-        env:
-          DEPLOYED_BY: ${{ inputs.approved_by }}
-          DEPLOY_VIA: gitops
-          IMAGE: ${{ needs.plan.outputs.image }}:${{ env.SHA }}
-        run: |
-          python3 .glwork/scripts/glwork_deploy.py promote-k8s .infra "$IMAGE"
-          cd .infra
-          git config user.name "gl-work-release-bot"; git config user.email "gl-work-release-bot@users.noreply.github.com"
-          git add fleet/apps-prod
-          git diff --cached --quiet && { echo "already released"; exit 0; }
-          git commit -m "release ${{ needs.plan.outputs.name }} $(echo "$SHA" | cut -c1-12) to ${{ fromJSON(needs.plan.outputs.prod).target }}" \
-                     -m "Approved by ${APPROVED_BY} in Telegram. Source: https://github.com/${{ github.repository }}/commit/${SHA}"
-          git push
-      # --- Cloudflare Workers: shift all traffic to the approved version ---
       - uses: actions/setup-node@v4
-        if: needs.plan.outputs.type == 'worker'
         with: {node-version: 22}
       - name: Release to production (worker)
-        if: needs.plan.outputs.type == 'worker'
         working-directory: ${{ fromJSON(needs.plan.outputs.prod).workdir }}
         run: |
+          export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
           [ -n "${{ inputs.worker_version }}" ] || { echo "::error::worker_version is required"; exit 1; }
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
           npx --yes wrangler@4 versions deploy "${{ inputs.worker_version }}@100%" \
@@ -263,19 +211,13 @@ jobs:
       - name: Notify Telegram
         if: always()
         env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           OK: ${{ job.status == 'success' }}
-          KIND: ${{ needs.plan.outputs.type }}
         run: |
-          [ -n "$TG_TOKEN" ] || exit 0
-          if [ "$OK" = true ]; then
-            head="✅ 正式发布已执行"; [ "$KIND" = k8s ] && head="📦 正式发布已提交 infra（Fleet 部署中，完成后集群会再通知）"
-          else head="❌ 正式发布失败"; fi
+          head="✅ 正式发布完成（Worker）"; [ "$OK" = true ] || head="❌ 正式发布失败（Worker）"
           text="$head
           应用：<code>${{ github.repository }}</code>
           版本：<code>$(echo "$SHA" | cut -c1-12)</code>
           审核人：${APPROVED_BY}
           详情：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          python3 -c 'import json,os,sys;print(json.dumps({"chat_id":os.environ["TG_CHAT"],"text":sys.argv[1],"parse_mode":"HTML","disable_web_page_preview":True}))' "$text" \
-            | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TG_TOKEN/sendMessage" >/dev/null
+          python3 -c 'import json,os,sys;print(json.dumps({"chat_id":os.environ["TELEGRAM_CHAT_ID"],"text":sys.argv[1],"parse_mode":"HTML","disable_web_page_preview":True}))' "$text" \
+            | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null
