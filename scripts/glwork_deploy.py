@@ -4,7 +4,8 @@
 Reads deploy.yml (all apps of a repository, test and production settings) from the
 application repository, validates it against the platform rules and renders what the
 workflow needs. Which apps a push deploys is decided by the tags on the pushed commit:
-"<app>@<version>", or "<app>" alone (the next version is assigned automatically).
+"<app>@<version>", or "<app>" alone (the next version is assigned automatically); several apps
+can share one tag separated by commas ("web@1.2,api@2.0" or "web,api").
 
   glwork_deploy.py plan                                 -> GITHUB_OUTPUT: apps to deploy ($DEPLOY_ENV, $TAGS)
   glwork_deploy.py render-k8s ENV APP IMAGE VERSION     -> Kubernetes manifests on stdout
@@ -37,7 +38,7 @@ REGISTRY = "glwork-registry.cn-hongkong.cr.aliyuncs.com/glwork"
 DESCRIPTOR = "deploy.yml"
 NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,38}[a-z0-9])?$")
 VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,40}$")
-SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+NUMERIC_VERSION_RE = re.compile(r"^\d+(\.\d+)*$")
 TEST_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.(int\.)?glwork\.dev$")
 PROD_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.glwork\.net$")
 FIELDS = {"type", "port", "health", "replicas", "cpu", "memory", "memory_limit", "env_secret", "context",
@@ -196,14 +197,13 @@ def git_lines(*args):
 
 
 def next_version(app, all_tags):
+    """Highest numeric version of the app with its last part + 1 (2.0 -> 2.1, 1.4.0 -> 1.4.1); first: 1.0.0."""
     best = None
     for t in all_tags:
-        if t.startswith(app + "@"):
-            m = SEMVER_RE.match(t[len(app) + 1:])
-            if m:
-                v = tuple(int(x) for x in m.groups())
-                best = v if best is None or v > best else best
-    return "1.0.0" if best is None else f"{best[0]}.{best[1]}.{best[2] + 1}"
+        if t.startswith(app + "@") and NUMERIC_VERSION_RE.match(t[len(app) + 1:]):
+            v = tuple(int(x) for x in t[len(app) + 1:].split("."))
+            best = v if best is None or v > best else best
+    return "1.0.0" if best is None else ".".join(map(str, best[:-1] + (best[-1] + 1,)))
 
 
 def cmd_plan():
@@ -227,29 +227,38 @@ def cmd_plan():
     head_tags = os.environ.get("TAGS", "").split() or git_lines("tag", "--points-at", "HEAD")
     all_tags = git_lines("tag", "-l")
     deploy, problems, seen = [], [], set()
-    for t in sorted(head_tags):
+    # "web@1.2,api@2.0" (or "web,api") is shorthand for several app tags: each app gets its own
+    # <app>@<version> tag and the combined tag is removed, so per-app history stays in git tag -l.
+    parts = [(p.strip(), t) for t in sorted(head_tags) for p in t.split(",") if p.strip()]
+    for t, source in parts:
+        combined = "," in source
         app, _, version = t.partition("@")
         if app not in doc["apps"]:
             if NAME_RE.match(app):  # looks like an app tag; anything else (v1.2, etc.) is ignored
-                problems.append(f"tag {t}: no app '{app}' in {DESCRIPTOR} (apps: {', '.join(names)})")
+                problems.append(f"tag {source}: no app '{app}' in {DESCRIPTOR} (apps: {', '.join(names)})")
             continue
         if app in seen:
+            problems.append(f"tag {source}: app '{app}' appears more than once on this commit; deployed once")
             continue
         s = settings(doc, app, env)
         if s is None:
-            problems.append(f"tag {t}: apps.{app} has no '{env}' section in {DESCRIPTOR}")
+            problems.append(f"tag {source}: apps.{app} has no '{env}' section in {DESCRIPTOR}")
             continue
-        create, bare = False, ""
+        create, bare = False, (source if combined or not version else "")
         if not version:
-            bare = t
-            existing = [x for x in head_tags if x.startswith(app + "@")]
+            existing = [x for x in head_tags if x.startswith(app + "@") and "," not in x]
             if existing:  # the commit already has a version: never give one commit two versions
                 version = sorted(existing)[-1].split("@", 1)[1]
             else:
                 version, create = next_version(app, all_tags), True
         elif not VERSION_RE.match(version):
-            problems.append(f"tag {t}: version must be letters, digits, '.', '_' or '-'")
+            problems.append(f"tag {source}: version '{version}' must be letters, digits, '.', '_' or '-'")
             continue
+        elif combined and f"{app}@{version}" not in head_tags:
+            if f"{app}@{version}" in all_tags:
+                problems.append(f"tag {source}: {app}@{version} already exists on another commit; use a new version")
+                continue
+            create = True
         seen.add(app)
         deploy.append({"app": app, "version": version, "tag": f"{app}@{version}", "create": create,
                        "bare": bare, "type": s["type"]})
