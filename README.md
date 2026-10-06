@@ -9,6 +9,7 @@
   Telegram 群发起一条审核，群管理员确认后由 release-bot 发布（容器应用提交到 infra `fleet/apps-prod/<应用>/`，Fleet 部署到
   `target` 指定的集群，默认 `office`；Worker 触发 `action=promote`）。提交上没有应用 tag 时不部署，群里会收到提示。
   可用的 `target` 登记在 `scripts/glwork_deploy.py` 的 `TARGETS`。
+- `DEPLOY.md`：给 AI agent 读的精简部署说明（应用仓库的 AGENTS.md / CLAUDE.md 可以引用 `https://raw.githubusercontent.com/GL-Game-Group/.github/main/DEPLOY.md`）。
 - `scripts/glwork_deploy.py`：解析 `deploy.yml`、按 tag 选择应用和版本、校验平台规则、生成部署清单与审核消息（只用标准库）。
 
 所有流水线都运行在内网构建机 `gl-internal` 上（公开和私有仓库都可用），密钥由 External Secrets Operator 从 mgmt 集群
