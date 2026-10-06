@@ -13,6 +13,8 @@ can share one tag separated by commas ("web@1.2,api@2.0" or "web,api").
   glwork_deploy.py promote-k8s INFRA_DIR APP IMAGE VERSION -> write the production bundle into infra
   glwork_deploy.py image-exists IMAGE:TAG               -> exit 0 if the tag is already in the registry
   glwork_deploy.py telegram TEXT                        -> Telegram sendMessage JSON for a notice
+  glwork_deploy.py ingress-conflict HOST NS NAME < ingresses.json -> exit 1 (reason on stdout) if
+                                                           another Ingress already serves HOST
 
 Only the standard library is used: deploy.yml is read by a small YAML subset parser
 (nested "key: value" mappings, inline {a: b} maps, '#' comments; no lists or anchors).
@@ -44,6 +46,8 @@ PROD_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.glwork\.net$")
 FIELDS = {"type", "port", "health", "replicas", "cpu", "memory", "memory_limit", "env_secret", "context",
           "dockerfile", "public", "team", "target", "host", "namespace", "wrangler_env", "workdir", "url"}
 ENVS = ("test", "prod")
+# Hosts that belong to the platform (not deployable by apps); other clusters' hosts are checked live.
+RESERVED_HOSTS = {"rancher.glwork.net": "Rancher 管理平台", "secrets.glwork.net": "配置入口"}
 
 
 def fail(msg):
@@ -167,6 +171,7 @@ def settings(doc, app, env):
     s["target"] = d.get("target", DEFAULT_TARGET)
     if s["target"] not in TARGETS:
         fail(f"{where}: target '{s['target']}' is not a registered cluster ({', '.join(TARGETS)}); ask the platform team")
+    s["direct"] = bool(TARGETS[s["target"]].get("direct"))  # the build machines can reach the cluster
     if env == "test":
         s["team"] = d.get("team", "")
         if not NAME_RE.match(s["team"] or "-"):
@@ -183,6 +188,23 @@ def settings(doc, app, env):
         if s["public"] and not PROD_HOST_RE.match(s["host"]):
             fail(f"{where}: host '{s['host']}' must be <name>.glwork.net")
     return s
+
+
+def host_problems(doc, env):
+    """Domain conflicts inside deploy.yml: {app: reason} (same host twice, or a platform host)."""
+    hosts, problems = {}, {}
+    for app in doc["apps"]:
+        s = settings(doc, app, env)
+        if s and s["type"] == "k8s" and s["public"]:
+            hosts.setdefault(s["host"], []).append(app)
+    for host, apps in hosts.items():
+        if host in RESERVED_HOSTS:
+            for a in apps:
+                problems[a] = f"域名 {host} 是平台保留域名（{RESERVED_HOSTS[host]}）"
+        elif len(apps) > 1:
+            for a in apps:
+                problems[a] = f"域名 {host} 在 {DESCRIPTOR} 中被多个应用使用：{', '.join(apps)}"
+    return problems
 
 
 def out(key, value):
@@ -227,6 +249,7 @@ def cmd_plan():
     head_tags = os.environ.get("TAGS", "").split() or git_lines("tag", "--points-at", "HEAD")
     all_tags = git_lines("tag", "-l")
     deploy, problems, seen = [], [], set()
+    conflicts = host_problems(doc, env)
     # "web@1.2,api@2.0" (or "web,api") is shorthand for several app tags: each app gets its own
     # <app>@<version> tag and the combined tag is removed, so per-app history stays in git tag -l.
     parts = [(p.strip(), t) for t in sorted(head_tags) for p in t.split(",") if p.strip()]
@@ -243,6 +266,9 @@ def cmd_plan():
         s = settings(doc, app, env)
         if s is None:
             problems.append(f"tag {source}: apps.{app} has no '{env}' section in {DESCRIPTOR}")
+            continue
+        if app in conflicts:
+            problems.append(f"tag {source}: {app} 未部署，{conflicts[app]}")
             continue
         create, bare = False, (source if combined or not version else "")
         if not version:
@@ -391,6 +417,10 @@ def cmd_approval_message(app, version):
         f"应用：<code>{esc(repo)}</code> · <b>{esc(app)}</b>（{s['type']}）",
         f"版本：<code>{esc(app)}@{esc(version)}</code> · 提交 <code>{sha[:12]}</code> {esc(title)}",
     ]
+    if s["type"] == "k8s" and s["public"]:
+        lines.append(f"域名：https://{esc(s['host'])}")
+    elif s.get("url"):
+        lines.append(f"地址：{esc(s['url'])}")
     if tested == "yes":
         lines.append("测试环境：✅ 已构建并部署过此提交")
     elif tested == "no":
@@ -405,6 +435,19 @@ def cmd_approval_message(app, version):
     req = {"r": repo, "s": sha, "t": s["target"], "k": s["type"], "a": app, "n": version, "v": worker_version}
     lines.append(f"<code>req {esc(json.dumps(req, separators=(',', ':')))}</code>")
     print(telegram_body("\n".join(lines), buttons=True))
+
+
+def cmd_ingress_conflict(host, namespace, name):
+    """Read `kubectl get ingress -A -o json` on stdin; fail if HOST is served by another Ingress."""
+    items = json.load(sys.stdin).get("items", [])
+    for ing in items:
+        m = ing["metadata"]
+        if (m["namespace"], m["name"]) == (namespace, name):
+            continue
+        for rule in ing.get("spec", {}).get("rules", []) or []:
+            if rule.get("host") == host:
+                print(f"域名 {host} 已被 {m['namespace']}/{m['name']} 使用")
+                sys.exit(1)
 
 
 def cmd_telegram(text):
@@ -488,6 +531,7 @@ def main():
         ("promote-k8s", 4): cmd_promote_k8s,
         ("image-exists", 1): cmd_image_exists,
         ("telegram", 1): cmd_telegram,
+        ("ingress-conflict", 3): cmd_ingress_conflict,
     }
     fn = cmds.get((a[0], len(a) - 1)) if a else None
     if not fn:

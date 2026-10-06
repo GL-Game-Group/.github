@@ -172,6 +172,19 @@ jobs:
       - id: s
         run: echo "json=$(python3 .glwork/scripts/glwork_deploy.py settings "$DEPLOY_ENV" "$APP")" >> "$GITHUB_OUTPUT"
 
+      # Domain conflicts on the target cluster (another Ingress already serving the host).
+      - name: Check domain
+        if: matrix.type == 'k8s' && fromJSON(steps.s.outputs.json).public && fromJSON(steps.s.outputs.json).direct
+        env:
+          HOST: ${{ fromJSON(steps.s.outputs.json).host }}
+          NS: ${{ fromJSON(steps.s.outputs.json).namespace }}
+        run: |
+          kubectl get ingress -A -o json > "$RUNNER_TEMP/ingresses.json"
+          if ! python3 .glwork/scripts/glwork_deploy.py ingress-conflict "$HOST" "$NS" "$APP" < "$RUNNER_TEMP/ingresses.json" > "$RUNNER_TEMP/reason"; then
+            echo "::error::$(cat "$RUNNER_TEMP/reason")"; exit 1
+          fi
+          rm -f "$RUNNER_TEMP/reason"
+
       # k8s: one image per app and commit, shared by test and production.
       - name: Build and push with BuildKit
         id: build
@@ -269,6 +282,22 @@ jobs:
           python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0) if d.get("ok") else sys.exit("::error::Telegram: %s" % d.get("description"))' "$RUNNER_TEMP/tg.json"
           echo "正式发布已提交审核：$APP@$VERSION，请群管理员在 Telegram 群点击「✅ 确认」。" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Notify Telegram (failure)
+        if: failure()
+        env:
+          HOST: ${{ steps.s.outputs.json && (fromJSON(steps.s.outputs.json).host || fromJSON(steps.s.outputs.json).url) || '' }}
+        run: |
+          reason=$(cat "$RUNNER_TEMP/reason" 2>/dev/null || echo "见构建日志")
+          what=$([ "$DEPLOY_ENV" = prod ] && echo "正式发布申请" || echo "测试部署")
+          text="❌ ${what}失败 · <b>$APP@$VERSION</b>
+          应用：<code>$GITHUB_REPOSITORY</code>
+          提交：<code>$(echo "$DEPLOY_SHA" | cut -c1-12)</code>${HOST:+
+          域名：$HOST}
+          原因：$reason
+          构建：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          python3 .glwork/scripts/glwork_deploy.py telegram "$text" \
+            | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null
+
   # Workers only: k8s production releases are committed to infra by release-bot itself.
   promote:
     if: inputs.action == 'promote'
@@ -303,12 +332,14 @@ jobs:
         if: always()
         env:
           OK: ${{ job.status == 'success' }}
+          URL: ${{ steps.s.outputs.json && fromJSON(steps.s.outputs.json).url || '' }}
         run: |
           head="✅ 正式发布完成（Worker）"; [ "$OK" = true ] || head="❌ 正式发布失败（Worker）"
           text="$head
           应用：<code>$GITHUB_REPOSITORY</code> · <b>$APP</b>
           提交：<code>$(echo "$DEPLOY_SHA" | cut -c1-12)</code>
-          审核人：${APPROVED_BY}
+          审核人：${APPROVED_BY}${URL:+
+          地址：$URL}
           详情：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           python3 .glwork/scripts/glwork_deploy.py telegram "$text" \
             | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null
