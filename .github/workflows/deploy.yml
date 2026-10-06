@@ -1,31 +1,43 @@
-# Reusable deploy workflow driven by deploy.test.yml / deploy.prod.yml in the app repository.
+# Reusable deploy workflow driven by deploy.yml in the app repository (all apps, test + prod).
 # Runs on the office build machines (runs-on: gl-internal); no GitHub secrets are used:
 # credentials come from the runner environment, synced by External Secrets Operator from the
 # mgmt cluster (namespace glwork-secrets, edited in Rancher).
 #
-#   push test    -> build (BuildKit) -> deploy deploy.test.yml (automatic)
-#   push release -> reuse the image built for that commit (or build) -> ask for approval in Telegram
-#   approval     -> release-bot: k8s = commits the release to infra fleet/apps-prod (Fleet deploys it
-#                                      to the cluster named by target:, default office)
+# Which apps: the tags on the pushed commit, "<app>@<version>" or "<app>" alone (the next
+# version is tagged automatically and the bare tag removed). No app tag -> nothing is deployed
+# and the Telegram group gets a notice.
+#
+#   push test    -> build each tagged app (BuildKit) -> deploy its test settings
+#   push release -> reuse the image of that commit (or build) -> one Telegram approval per app
+#   approval     -> release-bot: k8s = commits the release to infra fleet/apps-prod/<app>
+#                                      (Fleet deploys it to target:, default office)
 #                                worker = dispatches this workflow with action=promote
-#   (one job per run: every job costs ~13 s of runner start-up and teardown)
+#   manual run   -> action=deploy, env=test|prod, tag=<app>@<version>: redeploy or roll back
 #
-# Caller (.github/workflows/deploy.yml in the app repository):
+# Caller (.github/workflows/glwork.yml in the app repository):
 #
-#   name: deploy
+#   name: glwork
 #   on:
 #     push: {branches: [test, release]}
 #     workflow_dispatch:
 #       inputs:
-#         action: {default: push}
+#         action: {description: "deploy | promote", default: deploy}
+#         env: {description: "test | prod (manual deploy)", default: test}
+#         tag: {description: "<app>@<version> (manual deploy)", default: ""}
+#         app: {default: ""}
 #         sha: {default: ""}
 #         approved_by: {default: ""}
 #         worker_version: {default: ""}
+#   permissions:
+#     contents: write
 #   jobs:
-#     deploy:
+#     glwork:
 #       uses: GL-Game-Group/.github/.github/workflows/deploy.yml@main
 #       with:
-#         action: ${{ inputs.action || 'push' }}
+#         action: ${{ inputs.action || 'deploy' }}
+#         env: ${{ github.event_name == 'workflow_dispatch' && inputs.env || '' }}
+#         tag: ${{ inputs.tag }}
+#         app: ${{ inputs.app }}
 #         sha: ${{ inputs.sha }}
 #         approved_by: ${{ inputs.approved_by }}
 #         worker_version: ${{ inputs.worker_version }}
@@ -35,9 +47,20 @@ on:
   workflow_call:
     inputs:
       action:
-        description: push (build, test, request approval) or promote (worker production release)
+        description: deploy (tagged apps of the pushed branch) or promote (worker production release)
         type: string
-        default: push
+        default: deploy
+      env:
+        description: test | prod for a manual deploy; empty = from the branch (test / release)
+        type: string
+        default: ""
+      tag:
+        description: <app>@<version> for a manual deploy
+        type: string
+        default: ""
+      app:
+        type: string
+        default: ""
       sha:
         type: string
         default: ""
@@ -49,157 +72,232 @@ on:
         default: ""
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: deploy-${{ github.repository }}-${{ github.ref }}-${{ inputs.action }}
+  group: deploy-${{ github.repository }}-${{ github.ref }}-${{ inputs.action }}-${{ inputs.tag }}
   cancel-in-progress: false
 
-env:
-  SHA: ${{ inputs.sha || github.sha }}
-
 jobs:
-  push:
-    if: inputs.action == 'push'
+  plan:
+    if: inputs.action == 'deploy'
     runs-on: gl-internal
+    outputs:
+      env: ${{ steps.env.outputs.env }}
+      sha: ${{ steps.env.outputs.sha }}
+      deploy: ${{ steps.plan.outputs.deploy }}
+      count: ${{ steps.plan.outputs.count }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0
       - uses: actions/checkout@v4
         with: {repository: GL-Game-Group/.github, path: .glwork}
-      # Branch test deploys deploy.test.yml, branch release deploys deploy.prod.yml (after approval).
       - id: env
+        env:
+          INPUT_ENV: ${{ inputs.env }}
         run: |
-          case "$GITHUB_REF" in
-            refs/heads/test) echo "env=test" >> "$GITHUB_OUTPUT" ;;
-            refs/heads/release) echo "env=prod" >> "$GITHUB_OUTPUT" ;;
-            *) echo "::error::deploy runs on branch test (test environment) or release (production), not $GITHUB_REF_NAME"; exit 1 ;;
-          esac
+          if [ -n "$INPUT_ENV" ]; then env="$INPUT_ENV"
+          else
+            case "$GITHUB_REF" in
+              refs/heads/test) env=test ;;
+              refs/heads/release) env=prod ;;
+              *) echo "::error::deploy runs on branch test or release (or manually with env and tag), not $GITHUB_REF_NAME"; exit 1 ;;
+            esac
+          fi
+          [ "$env" = test ] || [ "$env" = prod ] || { echo "::error::env must be test or prod"; exit 1; }
+          echo "env=$env" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - id: plan
         env:
           DEPLOY_ENV: ${{ steps.env.outputs.env }}
-        run: |
-          python3 .glwork/scripts/glwork_deploy.py plan
-          grep -q '^has_current=true' "$GITHUB_OUTPUT" || echo "::notice::no deploy.$DEPLOY_ENV.yml in this repository: nothing to deploy from $GITHUB_REF_NAME"
-
-      # k8s: one image per commit, shared by test and production.
-      - name: Build and push with BuildKit
-        if: steps.plan.outputs.type == 'k8s' && steps.plan.outputs.has_current == 'true'
+          TAGS: ${{ inputs.tag }}
+        run: python3 .glwork/scripts/glwork_deploy.py plan
+      - name: Tag versions
+        if: steps.plan.outputs.count != '0'
         env:
-          IMAGE: ${{ steps.plan.outputs.image }}
-          CONTEXT: ${{ fromJSON(steps.plan.outputs.current).context || '.' }}
-          DOCKERFILE: ${{ fromJSON(steps.plan.outputs.current).dockerfile || '' }}
+          DEPLOY: ${{ steps.plan.outputs.deploy }}
         run: |
-          if python3 .glwork/scripts/glwork_deploy.py image-exists "$IMAGE:$GITHUB_SHA"; then
-            echo "镜像已存在，直接复用：\`$IMAGE:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          python3 -c 'import json,os
+          for d in json.loads(os.environ["DEPLOY"]):
+              print(d["tag"] if d["create"] else "-", d["bare"] or "-")' | while read -r new bare; do
+            if [ "$new" != - ]; then git tag "$new" HEAD && git push -q origin "refs/tags/$new"; echo "已打版本 tag：$new"; fi
+            if [ "$bare" != - ]; then git push -q origin ":refs/tags/$bare" || true; fi
+          done
+          python3 -c 'import json,os;print("本次部署：" + "、".join(d["tag"] for d in json.loads(os.environ["DEPLOY"])))' >> "$GITHUB_STEP_SUMMARY"
+      - name: Notify Telegram (nothing to deploy / problems)
+        if: (steps.plan.outputs.count == '0' && steps.plan.outputs.apps != '') || steps.plan.outputs.problems != ''
+        env:
+          COUNT: ${{ steps.plan.outputs.count }}
+          APPS: ${{ steps.plan.outputs.apps }}
+          PROBLEMS: ${{ steps.plan.outputs.problems }}
+          BRANCH: ${{ inputs.env || github.ref_name }}
+        run: |
+          short=$(git rev-parse --short=12 HEAD); title=$(git log -1 --pretty=%s | cut -c1-60)
+          first=$(echo "$APPS" | cut -d, -f1)
+          if [ -n "$PROBLEMS" ]; then
+            text="⚠️ 部署 tag 有问题 · <code>$GITHUB_REPOSITORY</code> 推送了 $BRANCH（$short $title）
+          $PROBLEMS"
+          else
+            text="ℹ️ 未部署 · <code>$GITHUB_REPOSITORY</code> 推送了 $BRANCH（$short $title）
+          最新提交上没有应用 tag。deploy.yml 中的应用：$APPS
+          发布方法：git tag $first &amp;&amp; git push origin $BRANCH $first"
+          fi
+          python3 .glwork/scripts/glwork_deploy.py telegram "$text" \
+            | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null
+          [ "$COUNT" != 0 ] || echo "::notice::最新提交上没有应用 tag（<应用> 或 <应用>@<版本>），未部署"
+          [ -z "$PROBLEMS" ] || echo "::warning::$PROBLEMS"
+
+  app:
+    name: ${{ matrix.tag }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: gl-internal
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.deploy) }}
+    env:
+      APP: ${{ matrix.app }}
+      VERSION: ${{ matrix.version }}
+      DEPLOY_ENV: ${{ needs.plan.outputs.env }}
+      DEPLOY_SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: "${{ needs.plan.outputs.sha }}"}
+      - uses: actions/checkout@v4
+        with: {repository: GL-Game-Group/.github, path: .glwork}
+      - id: s
+        run: echo "json=$(python3 .glwork/scripts/glwork_deploy.py settings "$DEPLOY_ENV" "$APP")" >> "$GITHUB_OUTPUT"
+
+      # k8s: one image per app and commit, shared by test and production.
+      - name: Build and push with BuildKit
+        id: build
+        if: matrix.type == 'k8s'
+        env:
+          IMAGE: glwork-registry.cn-hongkong.cr.aliyuncs.com/glwork/${{ matrix.app }}
+          CONTEXT: ${{ fromJSON(steps.s.outputs.json).context }}
+          DOCKERFILE: ${{ fromJSON(steps.s.outputs.json).dockerfile }}
+        run: |
+          if python3 .glwork/scripts/glwork_deploy.py image-exists "$IMAGE:$DEPLOY_SHA"; then
+            echo "tested=yes" >> "$GITHUB_OUTPUT"
+            echo "镜像已存在，直接复用：\`$IMAGE:$DEPLOY_SHA\`" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          echo "tested=no" >> "$GITHUB_OUTPUT"
           mkdir -p ~/.docker
           python3 -c 'import base64,json,os;print(json.dumps({"auths":{os.environ["ACR_REGISTRY"]:{"auth":base64.b64encode((os.environ["ACR_USERNAME"]+":"+os.environ["ACR_PASSWORD"]).encode()).decode()}}}))' > ~/.docker/config.json
           file="${DOCKERFILE:-$CONTEXT/Dockerfile}"
           buildctl build --frontend dockerfile.v0 \
             --local context="$CONTEXT" --local dockerfile="$(dirname "$file")" --opt filename="$(basename "$file")" \
             --opt platform=linux/amd64 \
-            --output "type=image,name=$IMAGE:$GITHUB_SHA,push=true"
-          echo "镜像：\`$IMAGE:$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+            --output "type=image,name=$IMAGE:$DEPLOY_SHA,push=true"
+          echo "镜像：\`$IMAGE:$DEPLOY_SHA\`" >> "$GITHUB_STEP_SUMMARY"
       - name: Deploy to the test environment
-        if: steps.plan.outputs.type == 'k8s' && steps.env.outputs.env == 'test' && steps.plan.outputs.has_current == 'true'
+        if: matrix.type == 'k8s' && env.DEPLOY_ENV == 'test'
         env:
           DEPLOYED_BY: ${{ github.actor }}
           DEPLOY_VIA: ci
-          IMAGE: ${{ steps.plan.outputs.image }}:${{ github.sha }}
-          NAME: ${{ steps.plan.outputs.name }}
-          NS: ${{ fromJSON(steps.plan.outputs.test || '{}').namespace }}
-          HOST: ${{ fromJSON(steps.plan.outputs.test || '{}').host }}
+          IMAGE: glwork-registry.cn-hongkong.cr.aliyuncs.com/glwork/${{ matrix.app }}:${{ needs.plan.outputs.sha }}
+          NS: ${{ fromJSON(steps.s.outputs.json).namespace }}
+          HOST: ${{ fromJSON(steps.s.outputs.json).host }}
         run: |
           allowed=$(kubectl -n ci get configmap repo-teams -o json | python3 -c 'import json,os,sys;print(json.load(sys.stdin)["data"].get(os.environ["GITHUB_REPOSITORY"].replace("/","."),""))')
           [ "$allowed" = "$NS" ] || { echo "::error::$GITHUB_REPOSITORY may not deploy into '$NS' (registered team: '${allowed:-none}'). Ask the platform team to add it to infra fleet/platform/ci/repo-teams.yaml"; exit 1; }
-          python3 .glwork/scripts/glwork_deploy.py render-k8s test "$IMAGE" > "$RUNNER_TEMP/manifests.yaml"
+          owner=$(kubectl -n "$NS" get deploy "$APP" -o jsonpath='{.metadata.annotations.glwork\.net/repository}' 2>/dev/null || true)
+          [ -z "$owner" ] || [ "$owner" = "$GITHUB_REPOSITORY" ] || { echo "::error::app name '$APP' is already used by $owner in namespace $NS; rename the app in deploy.yml"; exit 1; }
+          python3 .glwork/scripts/glwork_deploy.py render-k8s test "$APP" "$IMAGE" "$VERSION" > "$RUNNER_TEMP/manifests.yaml"
           kubectl apply -f "$RUNNER_TEMP/manifests.yaml"
-          kubectl -n "$NS" rollout status "deploy/$NAME" --timeout=600s
-          echo "测试环境：https://$HOST" >> "$GITHUB_STEP_SUMMARY"
+          kubectl -n "$NS" rollout status "deploy/$APP" --timeout=600s
+          echo "测试环境：https://$HOST（$APP@$VERSION）" >> "$GITHUB_STEP_SUMMARY"
 
-      # worker: deploy the test environment with wrangler.
+      # worker: test environment with wrangler; production uploads a version without traffic.
       - uses: actions/setup-node@v4
-        if: steps.plan.outputs.type == 'worker' && steps.plan.outputs.has_current == 'true'
+        if: matrix.type == 'worker'
         with: {node-version: 22}
       - name: Deploy worker (test)
-        if: steps.plan.outputs.type == 'worker' && steps.env.outputs.env == 'test' && steps.plan.outputs.has_current == 'true'
-        working-directory: ${{ fromJSON(steps.plan.outputs.test || '{}').workdir || '.' }}
+        if: matrix.type == 'worker' && env.DEPLOY_ENV == 'test'
+        working-directory: ${{ fromJSON(steps.s.outputs.json).workdir }}
         env:
-          WRANGLER_ENV: ${{ fromJSON(steps.plan.outputs.test || '{}').wrangler_env }}
+          WRANGLER_ENV: ${{ fromJSON(steps.s.outputs.json).wrangler_env }}
         run: |
           export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
           [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::CLOUDFLARE_WORKERS_TOKEN is empty (Rancher: mgmt cluster, glwork-secrets/cloudflare-workers)"; exit 1; }
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
           npx --yes wrangler@4 deploy --env "$WRANGLER_ENV"
       - name: Notify Telegram (worker test)
-        if: steps.plan.outputs.type == 'worker' && steps.env.outputs.env == 'test' && steps.plan.outputs.has_current == 'true'
+        if: matrix.type == 'worker' && env.DEPLOY_ENV == 'test'
         env:
-          URL: ${{ fromJSON(steps.plan.outputs.test || '{}').url }}
-          WRANGLER_ENV: ${{ fromJSON(steps.plan.outputs.test || '{}').wrangler_env }}
+          URL: ${{ fromJSON(steps.s.outputs.json).url }}
         run: |
-          text="✅ 发布成功 · <b>worker:${WRANGLER_ENV}</b>
-          应用：<code>${{ github.repository }}</code>
-          提交：<code>$(echo "$SHA" | cut -c1-12)</code>
-          部署人：${{ github.actor }}
-          方式：ci${URL:+
+          text="✅ 发布成功 · <b>$APP@$VERSION</b>（worker 测试）
+          应用：<code>$GITHUB_REPOSITORY</code>
+          提交：<code>$(echo "$DEPLOY_SHA" | cut -c1-12)</code>
+          部署人：$GITHUB_ACTOR${URL:+
           地址：$URL}"
-          python3 -c 'import json,os,sys;print(json.dumps({"chat_id":os.environ["TELEGRAM_CHAT_ID"],"text":sys.argv[1],"parse_mode":"HTML","disable_web_page_preview":True}))' "$text" \
+          python3 .glwork/scripts/glwork_deploy.py telegram "$text" \
             | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null
-
-      # Production (branch release): ask for approval in Telegram.
       - name: Upload worker version (no traffic yet)
         id: upload
-        if: steps.plan.outputs.type == 'worker' && steps.env.outputs.env == 'prod' && steps.plan.outputs.has_current == 'true'
-        working-directory: ${{ fromJSON(steps.plan.outputs.prod || '{}').workdir || '.' }}
+        if: matrix.type == 'worker' && env.DEPLOY_ENV == 'prod'
+        working-directory: ${{ fromJSON(steps.s.outputs.json).workdir }}
         env:
-          WRANGLER_ENV: ${{ fromJSON(steps.plan.outputs.prod || '{}').wrangler_env }}
+          WRANGLER_ENV: ${{ fromJSON(steps.s.outputs.json).wrangler_env }}
         run: |
           export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
           npx --yes wrangler@4 versions upload --env "$WRANGLER_ENV" \
-            --tag "$(echo "$SHA" | cut -c1-12)" --message "$(git log -1 --pretty=%s | cut -c1-90)" | tee "$RUNNER_TEMP/upload.log"
+            --tag "$APP@$VERSION" --message "$(git log -1 --pretty=%s | cut -c1-90)" | tee "$RUNNER_TEMP/upload.log"
           v=$(grep -oE 'Worker Version ID: [0-9a-f-]+' "$RUNNER_TEMP/upload.log" | awk '{print $4}')
           [ -n "$v" ] || { echo "::error::could not read the uploaded Worker Version ID"; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # Production: one approval message per app.
       - name: Ask for approval in Telegram
-        if: steps.env.outputs.env == 'prod' && steps.plan.outputs.has_current == 'true'
+        if: env.DEPLOY_ENV == 'prod'
         env:
           WORKER_VERSION: ${{ steps.upload.outputs.version }}
+          TESTED: ${{ steps.build.outputs.tested }}
         run: |
           printf '%s' "$TELEGRAM_CHAT_ID" | python3 -c 'import sys;v=sys.stdin.read();sys.exit(0 if v.lstrip("-").isdigit() and v.isascii() else "::error::TELEGRAM_CHAT_ID must be ASCII digits with an optional leading - (Rancher: glwork-secrets/telegram)")'
           export COMMIT_TITLE="$(git log -1 --pretty=%s)"
-          python3 .glwork/scripts/glwork_deploy.py approval-message > "$RUNNER_TEMP/approval.json"
+          python3 .glwork/scripts/glwork_deploy.py approval-message "$APP" "$VERSION" > "$RUNNER_TEMP/approval.json"
           curl -sS -m 20 -H 'Content-Type: application/json' -d @"$RUNNER_TEMP/approval.json" \
             "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" > "$RUNNER_TEMP/tg.json"
           python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0) if d.get("ok") else sys.exit("::error::Telegram: %s" % d.get("description"))' "$RUNNER_TEMP/tg.json"
-          echo "正式发布已提交审核：请群管理员在 Telegram 群点击「✅ 确认」。" >> "$GITHUB_STEP_SUMMARY"
+          echo "正式发布已提交审核：$APP@$VERSION，请群管理员在 Telegram 群点击「✅ 确认」。" >> "$GITHUB_STEP_SUMMARY"
 
   # Workers only: k8s production releases are committed to infra by release-bot itself.
   promote:
     if: inputs.action == 'promote'
     runs-on: gl-internal
     env:
+      APP: ${{ inputs.app }}
       APPROVED_BY: ${{ inputs.approved_by }}
+      DEPLOY_SHA: ${{ inputs.sha }}
     steps:
       - uses: actions/checkout@v4
-        with: {ref: "${{ env.SHA }}"}
+        with: {ref: "${{ inputs.sha }}"}
       - uses: actions/checkout@v4
         with: {repository: GL-Game-Group/.github, path: .glwork}
-      - id: plan
-        run: python3 .glwork/scripts/glwork_deploy.py plan
+      - id: s
+        run: echo "json=$(python3 .glwork/scripts/glwork_deploy.py settings prod "$APP")" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v4
         with: {node-version: 22}
       - name: Release to production (worker)
-        working-directory: ${{ fromJSON(steps.plan.outputs.prod || '{}').workdir || '.' }}
+        working-directory: ${{ fromJSON(steps.s.outputs.json).workdir }}
         env:
-          WRANGLER_ENV: ${{ fromJSON(steps.plan.outputs.prod || '{}').wrangler_env }}
+          WRANGLER_ENV: ${{ fromJSON(steps.s.outputs.json).wrangler_env }}
+          TYPE: ${{ fromJSON(steps.s.outputs.json).type }}
+          WORKER_VERSION: ${{ inputs.worker_version }}
         run: |
-          [ "${{ steps.plan.outputs.type }}" = worker ] && [ "${{ steps.plan.outputs.has_prod }}" = true ] || { echo "::error::promote is only for type: worker with a deploy.prod.yml (k8s releases are committed to infra by release-bot)"; exit 1; }
+          [ "$TYPE" = worker ] || { echo "::error::promote is only for worker apps (k8s releases are committed to infra by release-bot)"; exit 1; }
+          [ -n "$WORKER_VERSION" ] || { echo "::error::worker_version is required"; exit 1; }
           export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
-          [ -n "${{ inputs.worker_version }}" ] || { echo "::error::worker_version is required"; exit 1; }
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
-          npx --yes wrangler@4 versions deploy "${{ inputs.worker_version }}@100%" \
+          npx --yes wrangler@4 versions deploy "$WORKER_VERSION@100%" \
             --env "$WRANGLER_ENV" --message "approved by ${APPROVED_BY}" --yes
       - name: Notify Telegram
         if: always()
@@ -208,9 +306,9 @@ jobs:
         run: |
           head="✅ 正式发布完成（Worker）"; [ "$OK" = true ] || head="❌ 正式发布失败（Worker）"
           text="$head
-          应用：<code>${{ github.repository }}</code>
-          版本：<code>$(echo "$SHA" | cut -c1-12)</code>
+          应用：<code>$GITHUB_REPOSITORY</code> · <b>$APP</b>
+          提交：<code>$(echo "$DEPLOY_SHA" | cut -c1-12)</code>
           审核人：${APPROVED_BY}
-          详情：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          python3 -c 'import json,os,sys;print(json.dumps({"chat_id":os.environ["TELEGRAM_CHAT_ID"],"text":sys.argv[1],"parse_mode":"HTML","disable_web_page_preview":True}))' "$text" \
+          详情：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          python3 .glwork/scripts/glwork_deploy.py telegram "$text" \
             | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null

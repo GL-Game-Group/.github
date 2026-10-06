@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""glwork deploy helper used by .github/workflows/deploy.yml.
+"""glwork deploy helper used by .github/workflows/deploy.yml and release-bot.
 
-Reads deploy.test.yml / deploy.prod.yml from an application repository, validates them
-against the platform rules and renders what the workflow needs.
+Reads deploy.yml (all apps of a repository, test and production settings) from the
+application repository, validates it against the platform rules and renders what the
+workflow needs. Which apps a push deploys is decided by the tags on the pushed commit:
+"<app>@<version>", or "<app>" alone (the next version is assigned automatically).
 
-  glwork_deploy.py plan                         -> GITHUB_OUTPUT: test/prod settings as JSON (current = $DEPLOY_ENV)
-  glwork_deploy.py render-k8s ENV IMAGE         -> Kubernetes manifests on stdout
-  glwork_deploy.py approval-message             -> Telegram sendMessage JSON on stdout
-  glwork_deploy.py promote-k8s INFRA_DIR IMAGE  -> write the production bundle into infra
-  glwork_deploy.py image-exists IMAGE:TAG       -> exit 0 if the tag is already in the registry
+  glwork_deploy.py plan                                 -> GITHUB_OUTPUT: apps to deploy ($DEPLOY_ENV, $TAGS)
+  glwork_deploy.py render-k8s ENV APP IMAGE VERSION     -> Kubernetes manifests on stdout
+  glwork_deploy.py approval-message APP VERSION         -> Telegram sendMessage JSON on stdout
+  glwork_deploy.py promote-k8s INFRA_DIR APP IMAGE VERSION -> write the production bundle into infra
+  glwork_deploy.py image-exists IMAGE:TAG               -> exit 0 if the tag is already in the registry
+  glwork_deploy.py telegram TEXT                        -> Telegram sendMessage JSON for a notice
 
-Only the standard library is used. The descriptor files are a small YAML subset:
-"key: value" lines, '#' comments, no nesting.
+Only the standard library is used: deploy.yml is read by a small YAML subset parser
+(nested "key: value" mappings, inline {a: b} maps, '#' comments; no lists or anchors).
 """
 import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -30,9 +34,15 @@ TARGETS = {
     "office": {"ingress": FRPS_IP, "proxied": False, "direct": True},  # office cluster, via the HK frps
 }
 REGISTRY = "glwork-registry.cn-hongkong.cr.aliyuncs.com/glwork"
+DESCRIPTOR = "deploy.yml"
 NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]{0,38}[a-z0-9])?$")
+VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,40}$")
+SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 TEST_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.(int\.)?glwork\.dev$")
 PROD_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.glwork\.net$")
+FIELDS = {"type", "port", "health", "replicas", "cpu", "memory", "memory_limit", "env_secret", "context",
+          "dockerfile", "public", "team", "target", "host", "namespace", "wrangler_env", "workdir", "url"}
+ENVS = ("test", "prod")
 
 
 def fail(msg):
@@ -40,49 +50,110 @@ def fail(msg):
     sys.exit(2)
 
 
-def load(path):
-    if not os.path.exists(path):
-        return None
-    out = {}
-    for n, raw in enumerate(open(path, encoding="utf-8"), 1):
-        line = re.sub(r"\s+#.*$", "", raw.rstrip("\n"))
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$", line)
-        if not m or line.startswith((" ", "\t")):
-            fail(f"{path}:{n}: expected 'key: value' (no nesting): {raw.strip()}")
-        v = m.group(2).strip()
+# --- deploy.yml -------------------------------------------------------------
+def parse_yaml(text, path=DESCRIPTOR):
+    """Nested block mappings, inline {k: v} maps and scalars; everything else is an error."""
+    def scalar(v):
+        v = v.strip()
         if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-            v = v[1:-1]
-        out[m.group(1)] = v
-    return out
+            return v[1:-1]
+        return v
+
+    root = {}
+    stack = [(-1, root)]
+    for n, raw in enumerate(text.splitlines(), 1):
+        if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+            fail(f"{path}:{n}: use spaces, not tabs, for indentation")
+        line = re.sub(r"(^|\s)#.*$", "", raw).rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        body = line.strip()
+        if body.startswith("- "):
+            fail(f"{path}:{n}: lists are not supported: {raw.strip()}")
+        m = re.match(r"^([A-Za-z0-9_.-]+)\s*:(?:\s+(.*))?$", body)
+        if not m:
+            fail(f"{path}:{n}: expected 'key: value': {raw.strip()}")
+        key, val = m.group(1), (m.group(2) or "").strip()
+        while stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1]
+        if key in parent:
+            fail(f"{path}:{n}: duplicate key '{key}'")
+        if val == "":
+            parent[key] = {}
+            stack.append((indent, parent[key]))
+        elif val.startswith("{"):
+            if not val.endswith("}"):
+                fail(f"{path}:{n}: inline map must end with '}}' on the same line")
+            inner, d = val[1:-1].strip(), {}
+            for part in filter(None, (p.strip() for p in inner.split(","))):
+                km = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.*)$", part)
+                if not km or km.group(2).strip().startswith(("{", "[")):
+                    fail(f"{path}:{n}: inline map entries must be 'key: value': {part}")
+                d[km.group(1)] = scalar(km.group(2))
+            parent[key] = d
+        elif val.startswith("["):
+            fail(f"{path}:{n}: lists are not supported: {raw.strip()}")
+        else:
+            parent[key] = scalar(val)
+    return root
 
 
-def repo_name():
-    return os.environ.get("GITHUB_REPOSITORY", "local/app").split("/", 1)[1].lower()
-
-
-def settings(env):
-    path = f"deploy.{env}.yml"
-    d = load(path)
-    if d is None:
+def load():
+    if not os.path.exists(DESCRIPTOR):
         return None
-    s = {"env": env, "file": path}
-    s["type"] = d.get("type", "k8s")
+    d = parse_yaml(open(DESCRIPTOR, encoding="utf-8").read())
+    for k in d:
+        if k not in ("defaults", "apps"):
+            fail(f"{DESCRIPTOR}: unknown top-level key '{k}' (expected defaults, apps)")
+    apps = d.get("apps")
+    if not isinstance(apps, dict) or not apps:
+        fail(f"{DESCRIPTOR}: 'apps' must list at least one app")
+    defaults = d.get("defaults", {})
+    check_fields(defaults, "defaults", envs=False)
+    for name, app in apps.items():
+        if not NAME_RE.match(name):
+            fail(f"{DESCRIPTOR}: app name '{name}' must be lowercase letters, digits and '-' (max 40)")
+        if not isinstance(app, dict):
+            fail(f"{DESCRIPTOR}: apps.{name} must be a mapping")
+        check_fields(app, f"apps.{name}", envs=True)
+    return {"defaults": defaults, "apps": apps}
+
+
+def check_fields(d, where, envs):
+    if not isinstance(d, dict):
+        fail(f"{DESCRIPTOR}: {where} must be a mapping")
+    for k, v in d.items():
+        if envs and k in ENVS:
+            if not isinstance(v, dict):
+                fail(f"{DESCRIPTOR}: {where}.{k} must be a mapping (use {{}} for defaults only)")
+            check_fields(v, f"{where}.{k}", envs=False)
+        elif k not in FIELDS:
+            fail(f"{DESCRIPTOR}: unknown field '{where}.{k}'")
+        elif isinstance(v, dict):
+            fail(f"{DESCRIPTOR}: {where}.{k} must be a value, not a mapping")
+
+
+def settings(doc, app, env):
+    """Merged settings of one app in one environment, or None when the app has no such section."""
+    a = doc["apps"].get(app)
+    if a is None or env not in a:
+        return None
+    d = {**doc["defaults"], **{k: v for k, v in a.items() if k not in ENVS}, **a[env]}
+    where = f"{DESCRIPTOR} apps.{app}.{env}"
+    s = {"env": env, "name": app, "type": d.get("type", "k8s")}
     if s["type"] not in ("k8s", "worker"):
-        fail(f"{path}: type must be k8s or worker")
-    s["name"] = d.get("name", repo_name())
-    if not NAME_RE.match(s["name"]):
-        fail(f"{path}: name '{s['name']}' must be lowercase letters, digits and '-' (max 40)")
+        fail(f"{where}: type must be k8s or worker")
     if s["type"] == "worker":
         s["wrangler_env"] = d.get("wrangler_env", "test" if env == "test" else "production")
         s["url"] = d.get("url", "")
         s["workdir"] = d.get("workdir", ".")
+        s["target"] = f"worker:{s['wrangler_env']}"
         return s
-    # k8s
     s["port"] = d.get("port", "8080")
     if not s["port"].isdigit():
-        fail(f"{path}: port must be a number")
+        fail(f"{where}: port must be a number")
     s["health"] = d.get("health", "/")
     s["replicas"] = d.get("replicas", "1" if env == "test" else "2")
     s["cpu"] = d.get("cpu", "50m")
@@ -94,22 +165,22 @@ def settings(env):
     s["public"] = d.get("public", "true") == "true"
     s["target"] = d.get("target", DEFAULT_TARGET)
     if s["target"] not in TARGETS:
-        fail(f"{path}: target '{s['target']}' is not a registered cluster ({', '.join(TARGETS)}); ask the platform team")
+        fail(f"{where}: target '{s['target']}' is not a registered cluster ({', '.join(TARGETS)}); ask the platform team")
     if env == "test":
         s["team"] = d.get("team", "")
         if not NAME_RE.match(s["team"] or "-"):
-            fail(f"{path}: team is required (the namespace assigned by the platform)")
+            fail(f"{where}: team is required (the namespace assigned by the platform)")
         if not TARGETS[s["target"]].get("direct"):
-            fail(f"{path}: test deployments currently run on target {DEFAULT_TARGET} only")
+            fail(f"{where}: test deployments currently run on target {DEFAULT_TARGET} only")
         s["namespace"] = s["team"]
-        s["host"] = d.get("host", f"{s['name']}.glwork.dev")
+        s["host"] = d.get("host", f"{app}.glwork.dev")
         if s["public"] and not TEST_HOST_RE.match(s["host"]):
-            fail(f"{path}: host '{s['host']}' must be <name>.glwork.dev or <name>.int.glwork.dev")
+            fail(f"{where}: host '{s['host']}' must be <name>.glwork.dev or <name>.int.glwork.dev")
     else:
-        s["namespace"] = d.get("namespace", s["name"])
-        s["host"] = d.get("host", f"{s['name']}.glwork.net")
+        s["namespace"] = d.get("namespace", app)
+        s["host"] = d.get("host", f"{app}.glwork.net")
         if s["public"] and not PROD_HOST_RE.match(s["host"]):
-            fail(f"{path}: host '{s['host']}' must be <name>.glwork.net")
+            fail(f"{where}: host '{s['host']}' must be <name>.glwork.net")
     return s
 
 
@@ -118,30 +189,86 @@ def out(key, value):
         f.write(f"{key}={value}\n")
 
 
+# --- which apps a push deploys ------------------------------------------------
+def git_lines(*args):
+    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    return [l.strip() for l in r.stdout.splitlines() if l.strip()] if r.returncode == 0 else []
+
+
+def next_version(app, all_tags):
+    best = None
+    for t in all_tags:
+        if t.startswith(app + "@"):
+            m = SEMVER_RE.match(t[len(app) + 1:])
+            if m:
+                v = tuple(int(x) for x in m.groups())
+                best = v if best is None or v > best else best
+    return "1.0.0" if best is None else f"{best[0]}.{best[1]}.{best[2] + 1}"
+
+
 def cmd_plan():
-    test, prod = settings("test"), settings("prod")
-    if not test and not prod:
-        fail("no deploy.test.yml or deploy.prod.yml in the repository root")
-    if test and prod and test["type"] != prod["type"]:
-        fail("deploy.test.yml and deploy.prod.yml must use the same type")
-    kind = (test or prod)["type"]
-    name = (test or prod)["name"]
-    out("type", kind)
-    out("name", name)
-    out("image", f"{REGISTRY}/{name}")
-    out("test", json.dumps(test or {}))
-    out("prod", json.dumps(prod or {}))
-    out("has_test", "true" if test else "false")
-    out("has_prod", "true" if prod else "false")
-    # DEPLOY_ENV (test | prod, from the pushed branch) selects the descriptor this run deploys.
-    cur = {"test": test, "prod": prod}.get(os.environ.get("DEPLOY_ENV", ""))
-    out("current", json.dumps(cur or {}))
-    out("has_current", "true" if cur else "false")
-    print(json.dumps({"type": kind, "name": name, "test": test, "prod": prod}, ensure_ascii=False, indent=2))
+    """Resolve the tags on the pushed commit into the apps to deploy.
+
+    $DEPLOY_ENV: test | prod. $TAGS: space-separated tags to use instead of `git tag --points-at HEAD`.
+    Outputs: deploy (JSON list of {app, version, tag, create, bare, type}), count, apps, problems.
+    """
+    env = os.environ.get("DEPLOY_ENV", "")
+    if env not in ENVS:
+        fail("DEPLOY_ENV must be test or prod")
+    doc = load()
+    if doc is None:
+        out("count", "0")
+        out("deploy", "[]")
+        out("problems", "")
+        print(f"no {DESCRIPTOR}: nothing to deploy")
+        return
+    names = sorted(doc["apps"])
+    out("apps", ", ".join(names))
+    head_tags = os.environ.get("TAGS", "").split() or git_lines("tag", "--points-at", "HEAD")
+    all_tags = git_lines("tag", "-l")
+    deploy, problems, seen = [], [], set()
+    for t in sorted(head_tags):
+        app, _, version = t.partition("@")
+        if app not in doc["apps"]:
+            if NAME_RE.match(app):  # looks like an app tag; anything else (v1.2, etc.) is ignored
+                problems.append(f"tag {t}: no app '{app}' in {DESCRIPTOR} (apps: {', '.join(names)})")
+            continue
+        if app in seen:
+            continue
+        s = settings(doc, app, env)
+        if s is None:
+            problems.append(f"tag {t}: apps.{app} has no '{env}' section in {DESCRIPTOR}")
+            continue
+        create, bare = False, ""
+        if not version:
+            bare = t
+            existing = [x for x in head_tags if x.startswith(app + "@")]
+            if existing:  # the commit already has a version: never give one commit two versions
+                version = sorted(existing)[-1].split("@", 1)[1]
+            else:
+                version, create = next_version(app, all_tags), True
+        elif not VERSION_RE.match(version):
+            problems.append(f"tag {t}: version must be letters, digits, '.', '_' or '-'")
+            continue
+        seen.add(app)
+        deploy.append({"app": app, "version": version, "tag": f"{app}@{version}", "create": create,
+                       "bare": bare, "type": s["type"]})
+    out("deploy", json.dumps(deploy))
+    out("count", str(len(deploy)))
+    out("problems", "; ".join(problems))
+    print(json.dumps({"env": env, "deploy": deploy, "problems": problems}, ensure_ascii=False, indent=2))
+
+
+def cmd_settings(env, app):
+    """One app's merged settings as JSON (for workflow steps)."""
+    s = settings(load() or fail(f"no {DESCRIPTOR}"), app, env)
+    if s is None:
+        fail(f"apps.{app} has no '{env}' section in {DESCRIPTOR}")
+    print(json.dumps(s))
 
 
 def render(s, image):
-    sha = os.environ.get("GITHUB_SHA", "")
+    sha = (os.environ.get("DEPLOY_SHA") or os.environ.get("GITHUB_SHA", ""))
     by = os.environ.get("DEPLOYED_BY", os.environ.get("GITHUB_ACTOR", ""))
     via = os.environ.get("DEPLOY_VIA", "ci")
     n = s["name"]
@@ -156,6 +283,7 @@ metadata:
   annotations:
     glwork.net/deployed-by: {json.dumps(by)}
     glwork.net/commit: {json.dumps(sha[:12])}
+    glwork.net/version: {json.dumps(s.get('version', ''))}
     glwork.net/via: {json.dumps(via)}
     glwork.net/repository: {json.dumps(os.environ.get('GITHUB_REPOSITORY', ''))}
     kubernetes.io/change-cause: {json.dumps(image + ' by ' + by)}
@@ -215,58 +343,77 @@ metadata:
     return y
 
 
-def cmd_render_k8s(env, image):
-    s = settings(env)
+def cmd_render_k8s(env, app, image, version):
+    s = settings(load() or fail(f"no {DESCRIPTOR}"), app, env)
     if not s or s["type"] != "k8s":
-        fail(f"deploy.{env}.yml is not a k8s descriptor")
+        fail(f"apps.{app}.{env} is not a k8s app")
+    s["version"] = version
     sys.stdout.write(render(s, image))
 
 
-def cmd_approval_message():
-    """Message the release-bot acts on. The last line carries the request in machine-readable form."""
-    s = settings("prod")
-    repo = os.environ["GITHUB_REPOSITORY"]
-    sha = os.environ["GITHUB_SHA"]
-    run = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
-    title = os.environ.get("COMMIT_TITLE", "").strip()[:80]
-    version = os.environ.get("WORKER_VERSION", "")
-    target = s["target"] if s["type"] == "k8s" else f"worker:{s['wrangler_env']}"
-    esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    lines = [
-        f"🟡 <b>待审核</b> · 正式发布 → <b>{esc(target)}</b>",
-        f"应用：<code>{esc(repo)}</code>（{s['type']}）",
-        f"版本：<code>{sha[:12]}</code> {esc(title)}",
-        f"发起人：{esc(os.environ.get('GITHUB_ACTOR', ''))}",
-        f"构建：{run}",
-        f"提交：https://github.com/{repo}/commit/{sha}",
-    ]
-    if version:
-        lines.append(f"Worker 版本：<code>{esc(version)}</code>")
-    lines.append("群管理员点击下方按钮审核，24 小时内有效。")
-    req = {"r": repo, "s": sha, "t": target, "k": s["type"], "v": version}
-    lines.append(f"<code>req {esc(json.dumps(req, separators=(',', ':')))}</code>")
-    body = {
-        "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-        "text": "\n".join(lines),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-        "reply_markup": {"inline_keyboard": [[
+def telegram_body(text, buttons=False):
+    body = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": True}
+    if buttons:
+        body["reply_markup"] = {"inline_keyboard": [[
             {"text": "✅ 确认", "callback_data": "approve"},
             {"text": "❌ 拒绝", "callback_data": "reject"},
-        ]]},
-    }
-    print(json.dumps(body, ensure_ascii=False))
+        ]]}
+    return json.dumps(body, ensure_ascii=False)
 
 
-def cmd_promote_k8s(infra_dir, image):
-    """Write fleet/apps-prod/<name>/ into the infra checkout (Fleet deploys it to the target cluster)."""
-    s = settings("prod")
-    d = os.path.join(infra_dir, "fleet", "apps-prod", s["name"])
+def esc(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def cmd_approval_message(app, version):
+    """Message the release-bot acts on. The last line carries the request in machine-readable form."""
+    s = settings(load() or fail(f"no {DESCRIPTOR}"), app, "prod")
+    if s is None:
+        fail(f"apps.{app} has no 'prod' section in {DESCRIPTOR}")
+    repo = os.environ["GITHUB_REPOSITORY"]
+    sha = (os.environ.get("DEPLOY_SHA") or os.environ["GITHUB_SHA"])
+    run = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
+    title = os.environ.get("COMMIT_TITLE", "").strip()[:80]
+    worker_version = os.environ.get("WORKER_VERSION", "")
+    tested = os.environ.get("TESTED", "")
+    lines = [
+        f"🟡 <b>待审核</b> · 正式发布 → <b>{esc(s['target'])}</b>",
+        f"应用：<code>{esc(repo)}</code> · <b>{esc(app)}</b>（{s['type']}）",
+        f"版本：<code>{esc(app)}@{esc(version)}</code> · 提交 <code>{sha[:12]}</code> {esc(title)}",
+    ]
+    if tested == "yes":
+        lines.append("测试环境：✅ 已构建并部署过此提交")
+    elif tested == "no":
+        lines.append("测试环境：⚠️ 此提交未在测试环境构建过")
+    lines += [
+        f"发起人：{esc(os.environ.get('GITHUB_ACTOR', ''))}",
+        f"构建：{run}",
+    ]
+    if worker_version:
+        lines.append(f"Worker 版本：<code>{esc(worker_version)}</code>")
+    lines.append("群管理员点击下方按钮审核，24 小时内有效。")
+    req = {"r": repo, "s": sha, "t": s["target"], "k": s["type"], "a": app, "n": version, "v": worker_version}
+    lines.append(f"<code>req {esc(json.dumps(req, separators=(',', ':')))}</code>")
+    print(telegram_body("\n".join(lines), buttons=True))
+
+
+def cmd_telegram(text):
+    print(telegram_body(text))
+
+
+def cmd_promote_k8s(infra_dir, app, image, version):
+    """Write fleet/apps-prod/<app>/ into the infra checkout (Fleet deploys it to the target cluster)."""
+    s = settings(load() or fail(f"no {DESCRIPTOR}"), app, "prod")
+    if not s or s["type"] != "k8s":
+        fail(f"apps.{app}.prod is not a k8s app")
+    s["version"] = version
+    d = os.path.join(infra_dir, "fleet", "apps-prod", app)
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "fleet.yaml"), "w") as f:
-        f.write(f"""# Managed by GL-Game-Group/.github deploy.yml (production release of {os.environ.get('GITHUB_REPOSITORY', '')}).
+        f.write(f"""# Managed by release-bot: production release of {os.environ.get('GITHUB_REPOSITORY', '')} app {app}@{version}.
 defaultNamespace: {s['namespace']}
-# Only the chosen target runs it; every other production cluster skips the bundle.
+# Only the chosen target runs it; every other cluster skips the bundle.
 targetCustomizations:
   - name: {s['target']}
     clusterSelector:
@@ -278,6 +425,7 @@ targetCustomizations:
     with open(os.path.join(d, "manifests.yaml"), "w") as f:
         f.write(render(s, image))
     print(d)
+    return s
 
 
 def cmd_image_exists(ref):
@@ -323,18 +471,19 @@ def cmd_image_exists(ref):
 
 def main():
     a = sys.argv[1:]
-    if a[:1] == ["plan"]:
-        cmd_plan()
-    elif a[:1] == ["render-k8s"] and len(a) == 3:
-        cmd_render_k8s(a[1], a[2])
-    elif a[:1] == ["approval-message"]:
-        cmd_approval_message()
-    elif a[:1] == ["promote-k8s"] and len(a) == 3:
-        cmd_promote_k8s(a[1], a[2])
-    elif a[:1] == ["image-exists"] and len(a) == 2:
-        cmd_image_exists(a[1])
-    else:
+    cmds = {
+        ("plan", 0): cmd_plan,
+        ("settings", 2): cmd_settings,
+        ("render-k8s", 4): cmd_render_k8s,
+        ("approval-message", 2): cmd_approval_message,
+        ("promote-k8s", 4): cmd_promote_k8s,
+        ("image-exists", 1): cmd_image_exists,
+        ("telegram", 1): cmd_telegram,
+    }
+    fn = cmds.get((a[0], len(a) - 1)) if a else None
+    if not fn:
         fail(__doc__)
+    fn(*a[1:])
 
 
 if __name__ == "__main__":
