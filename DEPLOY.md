@@ -55,9 +55,17 @@ apps:
 - 对外服务默认完全开放，服务要自带鉴权。
 - 大文件（模型、依赖）在 Dockerfile 中拆成多层。
 
-## 回滚 / 重新部署
+## 发布指定版本 / 回滚
 
-Actions → glwork → Run workflow：`env` 填 `test` 或 `prod`，`tag` 填旧版本如 `web@1.3.0`。`prod` 同样需要审核。
+部署只用推送分支：把 `test` / `release` 指向某个版本 tag 所在的提交，就是发布这个版本（不生成新版本号）。
+
+```bash
+git push origin 'web@1.4.3^{}:refs/heads/release'      # 把测试过的 web@1.4.3 发布为正式版
+git push -f origin 'web@1.4.2^{}:refs/heads/release'   # 回滚（分支往回移需要 -f；仍需审核）
+git push -f origin 'web@1.4.2^{}:refs/heads/test'      # 测试环境换回旧版本
+```
+
+`-f` 只用于 `test` / `release`，绝不用在 `main` 上。同一提交上其他应用的版本 tag 也会一起部署 / 发起审核。
 
 ## 查看结果
 
