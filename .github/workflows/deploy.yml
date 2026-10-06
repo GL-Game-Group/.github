@@ -178,6 +178,9 @@ jobs:
       - id: s
         run: |
           echo "json=$(python3 .glwork/scripts/glwork_deploy.py settings "$DEPLOY_ENV" "$APP")" >> "$GITHUB_OUTPUT"
+          # Latest switches (synced every minute); the pod environment may be older.
+          live=$(kubectl -n ci get secret glwork-approval -o jsonpath='{.data.approval\.json}' 2>/dev/null | base64 -d 2>/dev/null || true)
+          [ -z "$live" ] || export GLWORK_APPROVAL="$live"
           need=$(python3 .glwork/scripts/glwork_deploy.py needs-approval "$DEPLOY_ENV" "$APP")
           echo "approval=$need" >> "$GITHUB_OUTPUT"
           # go: deploy now (test without approval, or approved by the group)
