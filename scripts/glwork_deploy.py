@@ -338,7 +338,8 @@ def render(s, image):
     by = os.environ.get("DEPLOYED_BY", os.environ.get("GITHUB_ACTOR", ""))
     via = os.environ.get("DEPLOY_VIA", "ci")
     n = s["name"]
-    labels = f"{{app.kubernetes.io/name: {n}, app.kubernetes.io/managed-by: glwork-deploy}}"
+    # Not app.kubernetes.io/managed-by: Fleet (Helm) sets that one, which would show as drift.
+    labels = f"{{app.kubernetes.io/name: {n}, glwork.net/managed-by: glwork-deploy}}"
     env_from = f"          envFrom: [{{secretRef: {{name: {s['env_secret']}}}}}]\n" if s["env_secret"] else ""
     y = f"""apiVersion: apps/v1
 kind: Deployment
