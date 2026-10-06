@@ -8,7 +8,11 @@
 # and the Telegram group gets a notice.
 #
 #   push test    -> build each tagged app (BuildKit) -> deploy its test settings
+#                   (or ask for approval first when the policy says so)
 #   push release -> reuse the image of that commit (or build) -> one Telegram approval per app
+#                   (or release-bot releases right away when production approval is off)
+#   Approval switches: Rancher extension "GL 运维" -> mgmt glwork-secrets/glwork-settings
+#   (approval.json, synced into the runner environment as GLWORK_APPROVAL).
 #   approval     -> release-bot: k8s = commits the release to infra fleet/apps-prod/<app>
 #                                      (Fleet deploys it to target:, default office)
 #                                worker = dispatches this workflow with action=promote
@@ -164,13 +168,21 @@ jobs:
       VERSION: ${{ matrix.version }}
       DEPLOY_ENV: ${{ needs.plan.outputs.env }}
       DEPLOY_SHA: ${{ needs.plan.outputs.sha }}
+      # A deploy that release-bot started after the group approved it.
+      APPROVED: ${{ inputs.approved_by != '' && github.triggering_actor == 'gl-work-release-bot[bot]' && 'yes' || 'no' }}
     steps:
       - uses: actions/checkout@v4
         with: {ref: "${{ needs.plan.outputs.sha }}"}
       - uses: actions/checkout@v4
         with: {repository: GL-Game-Group/.github, path: .glwork}
       - id: s
-        run: echo "json=$(python3 .glwork/scripts/glwork_deploy.py settings "$DEPLOY_ENV" "$APP")" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "json=$(python3 .glwork/scripts/glwork_deploy.py settings "$DEPLOY_ENV" "$APP")" >> "$GITHUB_OUTPUT"
+          need=$(python3 .glwork/scripts/glwork_deploy.py needs-approval "$DEPLOY_ENV" "$APP")
+          echo "approval=$need" >> "$GITHUB_OUTPUT"
+          # go: deploy now (test without approval, or approved by the group)
+          if [ "$DEPLOY_ENV" = test ] && { [ "$need" = false ] || [ "$APPROVED" = yes ]; }; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; fi
+          echo "审批：$DEPLOY_ENV $( [ "$need" = true ] && echo 需要 || echo 不需要 )$( [ "$APPROVED" = yes ] && echo "（已由 ${{ inputs.approved_by }} 确认）" )" >> "$GITHUB_STEP_SUMMARY"
 
       # Domain conflicts on the target cluster (another Ingress already serving the host).
       - name: Check domain
@@ -209,9 +221,9 @@ jobs:
             --output "type=image,name=$IMAGE:$DEPLOY_SHA,push=true"
           echo "镜像：\`$IMAGE:$DEPLOY_SHA\`" >> "$GITHUB_STEP_SUMMARY"
       - name: Deploy to the test environment
-        if: matrix.type == 'k8s' && env.DEPLOY_ENV == 'test'
+        if: matrix.type == 'k8s' && steps.s.outputs.go == 'true'
         env:
-          DEPLOYED_BY: ${{ github.actor }}
+          DEPLOYED_BY: ${{ inputs.approved_by || github.actor }}
           DEPLOY_VIA: ci
           IMAGE: glwork-registry.cn-hongkong.cr.aliyuncs.com/glwork/${{ matrix.app }}:${{ needs.plan.outputs.sha }}
           NS: ${{ fromJSON(steps.s.outputs.json).namespace }}
@@ -231,7 +243,7 @@ jobs:
         if: matrix.type == 'worker'
         with: {node-version: 22}
       - name: Deploy worker (test)
-        if: matrix.type == 'worker' && env.DEPLOY_ENV == 'test'
+        if: matrix.type == 'worker' && steps.s.outputs.go == 'true'
         working-directory: ${{ fromJSON(steps.s.outputs.json).workdir }}
         env:
           WRANGLER_ENV: ${{ fromJSON(steps.s.outputs.json).wrangler_env }}
@@ -241,7 +253,7 @@ jobs:
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
           npx --yes wrangler@4 deploy --env "$WRANGLER_ENV"
       - name: Notify Telegram (worker test)
-        if: matrix.type == 'worker' && env.DEPLOY_ENV == 'test'
+        if: matrix.type == 'worker' && steps.s.outputs.go == 'true'
         env:
           URL: ${{ fromJSON(steps.s.outputs.json).url }}
         run: |
@@ -267,20 +279,38 @@ jobs:
           [ -n "$v" ] || { echo "::error::could not read the uploaded Worker Version ID"; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
-      # Production: one approval message per app.
+      # Approval in the Telegram group: production (one message per app), or test when the policy asks.
       - name: Ask for approval in Telegram
-        if: env.DEPLOY_ENV == 'prod'
+        if: steps.s.outputs.approval == 'true' && env.APPROVED != 'yes'
         env:
           WORKER_VERSION: ${{ steps.upload.outputs.version }}
           TESTED: ${{ steps.build.outputs.tested }}
         run: |
           printf '%s' "$TELEGRAM_CHAT_ID" | python3 -c 'import sys;v=sys.stdin.read();sys.exit(0 if v.lstrip("-").isdigit() and v.isascii() else "::error::TELEGRAM_CHAT_ID must be ASCII digits with an optional leading - (Rancher: glwork-secrets/telegram)")'
           export COMMIT_TITLE="$(git log -1 --pretty=%s)"
-          python3 .glwork/scripts/glwork_deploy.py approval-message "$APP" "$VERSION" > "$RUNNER_TEMP/approval.json"
+          python3 .glwork/scripts/glwork_deploy.py approval-message "$APP" "$VERSION" "$DEPLOY_ENV" > "$RUNNER_TEMP/approval.json"
           curl -sS -m 20 -H 'Content-Type: application/json' -d @"$RUNNER_TEMP/approval.json" \
             "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" > "$RUNNER_TEMP/tg.json"
           python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0) if d.get("ok") else sys.exit("::error::Telegram: %s" % d.get("description"))' "$RUNNER_TEMP/tg.json"
-          echo "正式发布已提交审核：$APP@$VERSION，请群管理员在 Telegram 群点击「✅ 确认」。" >> "$GITHUB_STEP_SUMMARY"
+          echo "已提交审核：$APP@$VERSION（$DEPLOY_ENV），请群管理员在 Telegram 群点击「✅ 确认」。" >> "$GITHUB_STEP_SUMMARY"
+
+      # Production approval switched off for this app: release-bot releases right away (it checks
+      # the policy itself, so this cannot bypass an approval that is required).
+      - name: Release without approval
+        if: env.DEPLOY_ENV == 'prod' && steps.s.outputs.approval == 'false'
+        env:
+          WORKER_VERSION: ${{ steps.upload.outputs.version }}
+          TYPE: ${{ matrix.type }}
+        run: |
+          body=$(python3 -c 'import json,os;print(json.dumps({"r":os.environ["GITHUB_REPOSITORY"],"s":os.environ["DEPLOY_SHA"],"a":os.environ["APP"],"n":os.environ["VERSION"],"k":os.environ["TYPE"],"v":os.environ.get("WORKER_VERSION",""),"by":os.environ["GITHUB_ACTOR"]}))')
+          code=$(curl -sS -m 120 -o "$RUNNER_TEMP/auto.json" -w '%{http_code}' -H 'Content-Type: application/json' -d "$body" \
+            http://release-bot.release-bot.svc.cluster.local:8080/auto-release || true)
+          cat "$RUNNER_TEMP/auto.json"; echo
+          if [ "$code" != 200 ]; then
+            python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("error","release-bot 无响应"))' "$RUNNER_TEMP/auto.json" > "$RUNNER_TEMP/reason" 2>/dev/null || echo "release-bot 无响应（HTTP $code）" > "$RUNNER_TEMP/reason"
+            echo "::error::$(cat "$RUNNER_TEMP/reason")"; exit 1
+          fi
+          echo "正式发布已自动提交（未开启审批）：$APP@$VERSION" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Telegram (failure)
         if: failure()

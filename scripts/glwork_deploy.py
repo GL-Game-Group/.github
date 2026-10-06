@@ -9,7 +9,8 @@ can share one tag separated by commas ("web@1.2,api@2.0" or "web,api").
 
   glwork_deploy.py plan                                 -> GITHUB_OUTPUT: apps to deploy ($DEPLOY_ENV, $TAGS)
   glwork_deploy.py render-k8s ENV APP IMAGE VERSION     -> Kubernetes manifests on stdout
-  glwork_deploy.py approval-message APP VERSION         -> Telegram sendMessage JSON on stdout
+  glwork_deploy.py needs-approval ENV APP               -> "true" / "false" from the approval policy
+  glwork_deploy.py approval-message APP VERSION [ENV]   -> Telegram sendMessage JSON on stdout (ENV default prod)
   glwork_deploy.py promote-k8s INFRA_DIR APP IMAGE VERSION -> write the production bundle into infra
   glwork_deploy.py image-exists IMAGE:TAG               -> exit 0 if the tag is already in the registry
   glwork_deploy.py telegram TEXT                        -> Telegram sendMessage JSON for a notice
@@ -207,6 +208,36 @@ def host_problems(doc, env):
     return problems
 
 
+def approval_policy():
+    """Approval switches edited in the Rancher extension (mgmt glwork-secrets/glwork-settings).
+
+    $GLWORK_APPROVAL (build machines) or /etc/glwork/approval.json (release-bot); missing: prod only.
+    """
+    raw = os.environ.get("GLWORK_APPROVAL", "")
+    if not raw and os.path.exists("/etc/glwork/approval.json"):
+        raw = open("/etc/glwork/approval.json", encoding="utf-8").read()
+    try:
+        p = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        p = {}
+    return {"test": bool(p.get("test", False)), "prod": bool(p.get("prod", True)),
+            "overrides": p.get("overrides") or []}
+
+
+def needs_approval(policy, repo, app, env):
+    """Most specific rule wins: repo + app, then repo + '*', then the global switch."""
+    repo = repo.lower()
+    for wanted in (app, "*"):
+        for o in policy["overrides"]:
+            if str(o.get("repo", "")).lower() == repo and o.get("app", "*") == wanted and o.get(env) is not None:
+                return bool(o[env])
+    return policy[env]
+
+
+def cmd_needs_approval(env, app):
+    print("true" if needs_approval(approval_policy(), os.environ.get("GITHUB_REPOSITORY", ""), app, env) else "false")
+
+
 def out(key, value):
     with open(os.environ.get("GITHUB_OUTPUT", "/dev/stdout"), "a") as f:
         f.write(f"{key}={value}\n")
@@ -401,11 +432,11 @@ def esc(t):
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def cmd_approval_message(app, version):
+def cmd_approval_message(app, version, env="prod"):
     """Message the release-bot acts on. The last line carries the request in machine-readable form."""
-    s = settings(load() or fail(f"no {DESCRIPTOR}"), app, "prod")
+    s = settings(load() or fail(f"no {DESCRIPTOR}"), app, env)
     if s is None:
-        fail(f"apps.{app} has no 'prod' section in {DESCRIPTOR}")
+        fail(f"apps.{app} has no '{env}' section in {DESCRIPTOR}")
     repo = os.environ["GITHUB_REPOSITORY"]
     sha = (os.environ.get("DEPLOY_SHA") or os.environ["GITHUB_SHA"])
     run = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
@@ -413,7 +444,7 @@ def cmd_approval_message(app, version):
     worker_version = os.environ.get("WORKER_VERSION", "")
     tested = os.environ.get("TESTED", "")
     lines = [
-        f"🟡 <b>待审核</b> · 正式发布 → <b>{esc(s['target'])}</b>",
+        f"🟡 <b>待审核</b> · {'正式发布' if env == 'prod' else '测试部署'} → <b>{esc(s['target'])}</b>",
         f"应用：<code>{esc(repo)}</code> · <b>{esc(app)}</b>（{s['type']}）",
         f"版本：<code>{esc(app)}@{esc(version)}</code> · 提交 <code>{sha[:12]}</code> {esc(title)}",
     ]
@@ -432,7 +463,7 @@ def cmd_approval_message(app, version):
     if worker_version:
         lines.append(f"Worker 版本：<code>{esc(worker_version)}</code>")
     lines.append("群管理员点击下方按钮审核，24 小时内有效。")
-    req = {"r": repo, "s": sha, "t": s["target"], "k": s["type"], "a": app, "n": version, "v": worker_version}
+    req = {"r": repo, "s": sha, "t": s["target"], "k": s["type"], "a": app, "n": version, "v": worker_version, "e": env}
     lines.append(f"<code>req {esc(json.dumps(req, separators=(',', ':')))}</code>")
     print(telegram_body("\n".join(lines), buttons=True))
 
@@ -528,6 +559,8 @@ def main():
         ("settings", 2): cmd_settings,
         ("render-k8s", 4): cmd_render_k8s,
         ("approval-message", 2): cmd_approval_message,
+        ("approval-message", 3): cmd_approval_message,
+        ("needs-approval", 2): cmd_needs_approval,
         ("promote-k8s", 4): cmd_promote_k8s,
         ("image-exists", 1): cmd_image_exists,
         ("telegram", 1): cmd_telegram,
