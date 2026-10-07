@@ -47,6 +47,16 @@ apps:
 - 只支持 `key: value` 和 `{a: b}`，不支持列表；未知字段直接报错。
 - 容器应用字段：`type`(k8s) `team` `target`(office) `namespace`(应用名) `port`(8080) `health`(/) `host` `public`(true) `replicas`(测试 1/正式 2) `cpu`(50m) `memory`(64Mi) `memory_limit`(256Mi) `env_secret` `database` `context`(.) `dockerfile`。
 - Worker 字段：`wrangler_env` `workdir` `url`。
+- 纯静态网站用 `type: static`，不要写 wrangler 配置：字段 `workdir`(.) `build` `output`(dist) `spa`(false) `host`。正式环境审核通过后才构建上线。
+
+  ```yaml
+  landing:
+    type: static
+    build: npm run build
+    output: dist
+    test: {host: landing.glwork.dev}
+    prod: {host: landing.glwork.net}
+  ```
 
 ## 规则
 
