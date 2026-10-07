@@ -16,6 +16,8 @@
 #   approval     -> release-bot: k8s = commits the release to infra fleet/apps-prod/<app>
 #                                      (Fleet deploys it to target:, default office)
 #                                worker = dispatches this workflow with action=promote
+#                                static = action=promote too: builds and deploys the site then
+#                                         (assets go live on upload, so nothing is uploaded before)
 #   manual run   -> action=deploy, env=test|prod, tag=<app>@<version>: redeploy or roll back
 #
 # Caller (.github/workflows/glwork.yml in the app repository):
@@ -243,7 +245,7 @@ jobs:
 
       # worker: test environment with wrangler; production uploads a version without traffic.
       - uses: actions/setup-node@v4
-        if: matrix.type == 'worker'
+        if: matrix.type == 'worker' || matrix.type == 'static'
         with: {node-version: 22}
       - name: Deploy worker (test)
         if: matrix.type == 'worker' && steps.s.outputs.go == 'true'
@@ -255,12 +257,36 @@ jobs:
           [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::CLOUDFLARE_WORKERS_TOKEN is empty (Rancher: mgmt cluster, glwork-secrets/cloudflare-workers)"; exit 1; }
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
           npx --yes wrangler@4 deploy --env "$WRANGLER_ENV"
-      - name: Notify Telegram (worker test)
-        if: matrix.type == 'worker' && steps.s.outputs.go == 'true'
+
+      # static: assets-only Worker, config written by the pipeline. Test deploys right away; production
+      # only proves that it builds here and deploys after approval (promote): assets uploaded with
+      # `wrangler versions upload` are served immediately, which would bypass the approval.
+      - name: Build static site
+        if: matrix.type == 'static' && (steps.s.outputs.go == 'true' || env.DEPLOY_ENV == 'prod')
+        env:
+          SETTINGS: ${{ steps.s.outputs.json }}
+        run: bash .glwork/scripts/static_build.sh "$DEPLOY_ENV" "$APP" "$RUNNER_TEMP/wrangler.json"
+      - name: Deploy static site (test)
+        if: matrix.type == 'static' && steps.s.outputs.go == 'true'
+        env:
+          HOST: ${{ fromJSON(steps.s.outputs.json).host }}
+        run: |
+          set -o pipefail
+          export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::CLOUDFLARE_WORKERS_TOKEN is empty (Rancher: mgmt cluster, glwork-secrets/cloudflare-workers)"; exit 1; }
+          if ! npx --yes wrangler@4 deploy -c "$RUNNER_TEMP/wrangler.json" 2>&1 | tee "$RUNNER_TEMP/wrangler.log"; then
+            if grep -q 100117 "$RUNNER_TEMP/wrangler.log"; then
+              echo "域名 $HOST 上还有旧的 DNS 记录（A / CNAME），请平台方在 Cloudflare 删除后重新发布" > "$RUNNER_TEMP/reason"
+            fi
+            exit 1
+          fi
+          echo "测试环境：https://$HOST（$APP@$VERSION）" >> "$GITHUB_STEP_SUMMARY"
+      - name: Notify Telegram (worker / static test)
+        if: (matrix.type == 'worker' || matrix.type == 'static') && steps.s.outputs.go == 'true'
         env:
           URL: ${{ fromJSON(steps.s.outputs.json).url }}
         run: |
-          text="✅ 发布成功 · <b>$APP@$VERSION</b>（worker 测试）
+          text="✅ 发布成功 · <b>$APP@$VERSION</b>（${{ matrix.type }} 测试）
           应用：<code>$GITHUB_REPOSITORY</code>
           提交：<code>$(echo "$DEPLOY_SHA" | cut -c1-12)</code>
           部署人：$GITHUB_ACTOR${URL:+
@@ -331,7 +357,7 @@ jobs:
           python3 .glwork/scripts/glwork_deploy.py telegram "$text" \
             | curl -fsS -m 20 -H 'Content-Type: application/json' -d @- "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null
 
-  # Workers only: k8s production releases are committed to infra by release-bot itself.
+  # Workers and static sites: k8s production releases are committed to infra by release-bot itself.
   promote:
     if: inputs.action == 'promote'
     runs-on: gl-internal
@@ -349,6 +375,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: {node-version: 22}
       - name: Release to production (worker)
+        if: fromJSON(steps.s.outputs.json).type != 'static'
         working-directory: ${{ fromJSON(steps.s.outputs.json).workdir }}
         env:
           WRANGLER_ENV: ${{ fromJSON(steps.s.outputs.json).wrangler_env }}
@@ -361,13 +388,28 @@ jobs:
           if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; fi
           npx --yes wrangler@4 versions deploy "$WORKER_VERSION@100%" \
             --env "$WRANGLER_ENV" --message "approved by ${APPROVED_BY}" --yes
+      - name: Release to production (static)
+        if: fromJSON(steps.s.outputs.json).type == 'static'
+        env:
+          SETTINGS: ${{ steps.s.outputs.json }}
+          HOST: ${{ fromJSON(steps.s.outputs.json).host }}
+        run: |
+          set -o pipefail
+          bash .glwork/scripts/static_build.sh prod "$APP" "$RUNNER_TEMP/wrangler.json"
+          export CLOUDFLARE_API_TOKEN="$CLOUDFLARE_WORKERS_TOKEN"
+          if ! npx --yes wrangler@4 deploy -c "$RUNNER_TEMP/wrangler.json" 2>&1 | tee "$RUNNER_TEMP/wrangler.log"; then
+            grep -q 100117 "$RUNNER_TEMP/wrangler.log" && echo "::error::域名 $HOST 上还有旧的 DNS 记录（A / CNAME），请平台方在 Cloudflare 删除后重新发布"
+            exit 1
+          fi
       - name: Notify Telegram
         if: always()
         env:
           OK: ${{ job.status == 'success' }}
           URL: ${{ steps.s.outputs.json && fromJSON(steps.s.outputs.json).url || '' }}
+          TYPE: ${{ steps.s.outputs.json && fromJSON(steps.s.outputs.json).type || '' }}
         run: |
-          head="✅ 正式发布完成（Worker）"; [ "$OK" = true ] || head="❌ 正式发布失败（Worker）"
+          kind=$([ "$TYPE" = static ] && echo 静态网站 || echo Worker)
+          head="✅ 正式发布完成（$kind）"; [ "$OK" = true ] || head="❌ 正式发布失败（$kind）"
           text="$head
           应用：<code>$GITHUB_REPOSITORY</code> · <b>$APP</b>
           提交：<code>$(echo "$DEPLOY_SHA" | cut -c1-12)</code>

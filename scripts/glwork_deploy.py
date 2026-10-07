@@ -12,6 +12,7 @@ can share one tag separated by commas ("web@1.2,api@2.0" or "web,api").
   glwork_deploy.py needs-approval ENV APP               -> "true" / "false" from the approval policy
   glwork_deploy.py approval-message APP VERSION [ENV]   -> Telegram sendMessage JSON on stdout (ENV default prod)
   glwork_deploy.py promote-k8s INFRA_DIR APP IMAGE VERSION -> write the production bundle into infra
+  glwork_deploy.py wrangler-static ENV APP ASSETS_DIR    -> wrangler config of a static site (type: static)
   glwork_deploy.py image-exists IMAGE:TAG               -> exit 0 if the tag is already in the registry
   glwork_deploy.py telegram TEXT                        -> Telegram sendMessage JSON for a notice
   glwork_deploy.py ingress-conflict HOST NS NAME < ingresses.json -> exit 1 (reason on stdout) if
@@ -44,9 +45,11 @@ VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,40}$")
 NUMERIC_VERSION_RE = re.compile(r"^\d+(\.\d+)*$")
 TEST_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.(int\.)?glwork\.dev$")
 PROD_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.glwork\.net$")
+# Static sites are served by Cloudflare, so int.glwork.dev (office-only) does not apply.
+TEST_STATIC_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.glwork\.dev$")
 FIELDS = {"type", "port", "health", "replicas", "cpu", "memory", "memory_limit", "env_secret", "context",
           "dockerfile", "public", "team", "target", "host", "namespace", "wrangler_env", "workdir", "url",
-          "database"}
+          "database", "build", "output", "spa"}
 ENVS = ("test", "prod")
 # Hosts that belong to the platform (not deployable by apps); other clusters' hosts are checked live.
 RESERVED_HOSTS = {"rancher.glwork.net": "Rancher 管理平台", "secrets.glwork.net": "配置入口"}
@@ -150,11 +153,28 @@ def settings(doc, app, env):
     d = {**doc["defaults"], **{k: v for k, v in a.items() if k not in ENVS}, **a[env]}
     where = f"{DESCRIPTOR} apps.{app}.{env}"
     s = {"env": env, "name": app, "type": d.get("type", "k8s")}
-    if s["type"] not in ("k8s", "worker"):
-        fail(f"{where}: type must be k8s or worker")
+    if s["type"] not in ("k8s", "worker", "static"):
+        fail(f"{where}: type must be k8s, worker or static")
     database = d.get("database", "")
     if database not in ("", "postgres"):
         fail(f"{where}: database must be postgres")
+    if s["type"] == "static":
+        # Assets-only Cloudflare Worker; the pipeline writes its wrangler config (wrangler-static).
+        if database:
+            fail(f"{where}: database is only for k8s apps (static sites run on Cloudflare)")
+        s["workdir"] = d.get("workdir", ".")
+        s["build"] = d.get("build", "")
+        s["output"] = d.get("output", "dist")
+        s["spa"] = d.get("spa", "false") == "true"
+        s["public"] = True
+        s["host"] = d.get("host", f"{app}.glwork.{'dev' if env == 'test' else 'net'}")
+        host_re = TEST_STATIC_HOST_RE if env == "test" else PROD_HOST_RE
+        if not host_re.match(s["host"]):
+            fail(f"{where}: host '{s['host']}' must be <name>.glwork.{'dev' if env == 'test' else 'net'}")
+        s["url"] = f"https://{s['host']}"
+        s["worker"] = f"{app}-test" if env == "test" else app
+        s["target"] = "cloudflare"
+        return s
     if s["type"] == "worker":
         if database:
             fail(f"{where}: database is only for k8s apps (Workers cannot reach the office database)")
@@ -203,7 +223,7 @@ def host_problems(doc, env):
     hosts, problems = {}, {}
     for app in doc["apps"]:
         s = settings(doc, app, env)
-        if s and s["type"] == "k8s" and s["public"]:
+        if s and s["type"] in ("k8s", "static") and s["public"]:
             hosts.setdefault(s["host"], []).append(app)
     for host, apps in hosts.items():
         if host in RESERVED_HOSTS:
@@ -493,6 +513,22 @@ def cmd_ingress_conflict(host, namespace, name):
                 sys.exit(1)
 
 
+def cmd_wrangler_static(env, app, assets):
+    """wrangler config (JSON) of a static site: assets-only Worker bound to the app's host."""
+    s = settings(load() or fail(f"no {DESCRIPTOR}"), app, env)
+    if not s or s["type"] != "static":
+        fail(f"apps.{app}.{env} is not a static app")
+    print(json.dumps({
+        "name": s["worker"],
+        "compatibility_date": "2025-10-01",
+        "workers_dev": False,
+        "preview_urls": False,
+        "assets": {"directory": assets, "html_handling": "auto-trailing-slash",
+                   "not_found_handling": "single-page-application" if s["spa"] else "404-page"},
+        "routes": [{"pattern": s["host"], "custom_domain": True}],
+    }, indent=2))
+
+
 def cmd_telegram(text):
     print(telegram_body(text))
 
@@ -578,6 +614,7 @@ def main():
         ("promote-k8s", 4): cmd_promote_k8s,
         ("image-exists", 1): cmd_image_exists,
         ("telegram", 1): cmd_telegram,
+        ("wrangler-static", 3): cmd_wrangler_static,
         ("ingress-conflict", 3): cmd_ingress_conflict,
     }
     fn = cmds.get((a[0], len(a) - 1)) if a else None
