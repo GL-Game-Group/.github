@@ -45,7 +45,8 @@ NUMERIC_VERSION_RE = re.compile(r"^\d+(\.\d+)*$")
 TEST_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.(int\.)?glwork\.dev$")
 PROD_HOST_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?\.glwork\.net$")
 FIELDS = {"type", "port", "health", "replicas", "cpu", "memory", "memory_limit", "env_secret", "context",
-          "dockerfile", "public", "team", "target", "host", "namespace", "wrangler_env", "workdir", "url"}
+          "dockerfile", "public", "team", "target", "host", "namespace", "wrangler_env", "workdir", "url",
+          "database"}
 ENVS = ("test", "prod")
 # Hosts that belong to the platform (not deployable by apps); other clusters' hosts are checked live.
 RESERVED_HOSTS = {"rancher.glwork.net": "Rancher 管理平台", "secrets.glwork.net": "配置入口"}
@@ -151,7 +152,12 @@ def settings(doc, app, env):
     s = {"env": env, "name": app, "type": d.get("type", "k8s")}
     if s["type"] not in ("k8s", "worker"):
         fail(f"{where}: type must be k8s or worker")
+    database = d.get("database", "")
+    if database not in ("", "postgres"):
+        fail(f"{where}: database must be postgres")
     if s["type"] == "worker":
+        if database:
+            fail(f"{where}: database is only for k8s apps (Workers cannot reach the office database)")
         s["wrangler_env"] = d.get("wrangler_env", "test" if env == "test" else "production")
         s["url"] = d.get("url", "")
         s["workdir"] = d.get("workdir", ".")
@@ -166,6 +172,7 @@ def settings(doc, app, env):
     s["memory"] = d.get("memory", "64Mi")
     s["memory_limit"] = d.get("memory_limit", "256Mi")
     s["env_secret"] = d.get("env_secret", "")
+    s["database"] = database
     s["context"] = d.get("context", ".")
     s["dockerfile"] = d.get("dockerfile", "")
     s["public"] = d.get("public", "true") == "true"
@@ -340,13 +347,17 @@ def render(s, image):
     n = s["name"]
     # Not app.kubernetes.io/managed-by: Fleet (Helm) sets that one, which would show as drift.
     labels = f"{{app.kubernetes.io/name: {n}, glwork.net/managed-by: glwork-deploy}}"
-    env_from = f"          envFrom: [{{secretRef: {{name: {s['env_secret']}}}}}]\n" if s["env_secret"] else ""
+    # database: postgres -> db-provisioner (infra fleet/platform/db-provisioner) creates Secret <app>-db;
+    # the pod waits for it, then reads DATABASE_URL / PG* from it.
+    refs = [x for x in (s["env_secret"], f"{n}-db" if s.get("database") else "") if x]
+    env_from = f"          envFrom: [{', '.join(f'{{secretRef: {{name: {x}}}}}' for x in refs)}]\n" if refs else ""
+    dep_labels = labels if not s.get("database") else labels[:-1] + f", glwork.net/database: {s['database']}}}"
     y = f"""apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {n}
   namespace: {s['namespace']}
-  labels: {labels}
+  labels: {dep_labels}
   annotations:
     glwork.net/deployed-by: {json.dumps(by)}
     glwork.net/commit: {json.dumps(sha[:12])}
@@ -497,6 +508,8 @@ def cmd_promote_k8s(infra_dir, app, image, version):
     with open(os.path.join(d, "fleet.yaml"), "w") as f:
         f.write(f"""# Managed by release-bot: production release of {os.environ.get('GITHUB_REPOSITORY', '')} app {app}@{version}.
 defaultNamespace: {s['namespace']}
+# Marks the namespace as a production app's (db-provisioner then uses the internal database).
+namespaceLabels: {{glwork.net/env: prod}}
 # Only the chosen target runs it; every other cluster skips the bundle.
 targetCustomizations:
   - name: {s['target']}

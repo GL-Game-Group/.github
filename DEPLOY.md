@@ -45,13 +45,14 @@ apps:
 
 - 应用下的字段两个环境都生效，`test:` / `prod:` 中的覆盖之；缺 `test:` 不能发测试，缺 `prod:` 不能发正式。
 - 只支持 `key: value` 和 `{a: b}`，不支持列表；未知字段直接报错。
-- 容器应用字段：`type`(k8s) `team` `target`(office) `namespace`(应用名) `port`(8080) `health`(/) `host` `public`(true) `replicas`(测试 1/正式 2) `cpu`(50m) `memory`(64Mi) `memory_limit`(256Mi) `env_secret` `context`(.) `dockerfile`。
+- 容器应用字段：`type`(k8s) `team` `target`(office) `namespace`(应用名) `port`(8080) `health`(/) `host` `public`(true) `replicas`(测试 1/正式 2) `cpu`(50m) `memory`(64Mi) `memory_limit`(256Mi) `env_secret` `database` `context`(.) `dockerfile`。
 - Worker 字段：`wrangler_env` `workdir` `url`。
 
 ## 规则
 
 - 域名：测试 `<名称>.glwork.dev`，正式 `<名称>.glwork.net`，只用一级子域。不能与其他应用重复，不能用 `rancher.glwork.net`、`secrets.glwork.net`；冲突的应用会被拒绝部署。
 - 密钥不进 Git：放进命名空间的 Secret，在 `deploy.yml` 写 `env_secret: <Secret 名>`。正式环境的 Secret 由平台方创建。
+- 需要 PostgreSQL：写 `database: postgres`（仅 k8s 应用），测试 / 正式环境各自自动建库，应用读环境变量 `DATABASE_URL`（或 `PGHOST` `PGPORT` `PGDATABASE` `PGUSER` `PGPASSWORD`）。不要自己建库或把连接串写进代码。
 - 对外服务默认完全开放，服务要自带鉴权。
 - 大文件（模型、依赖）在 Dockerfile 中拆成多层。
 
