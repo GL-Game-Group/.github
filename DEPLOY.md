@@ -20,7 +20,7 @@ git push origin main:release       # 正式：同一提交，群管理员在 Tel
 
 1. 仓库需由平台方登记团队（`team`），未登记会报 `may not deploy into`，此时停下来告诉用户。
 2. 根目录添加 `deploy.yml`。
-3. 从 `GL-Game-Group/vitepress-demo` 原样复制 `.github/workflows/glwork.yml`，不要修改。
+3. 复制 `GL-Game-Group/vitepress-demo` 的 `.github/workflows/glwork.yml`，内容固定，不要修改。它是推送 `test` / `release` 时触发部署的入口（没有它推分支不会部署），构建在公司内网构建机上进行，不占 GitHub 付费额度，也不需要配置 GitHub Secret。
 
 ## deploy.yml
 
